@@ -108,8 +108,14 @@ approaches, and reading `set up` while no calendar is configured.
 | middle click | refetch the agenda now |
 
 The panel shows the next three meetings, the calendars you have configured
-(addresses masked), a field to paste a new one, and the alert and snooze
-delays. Everything it writes goes through the same `mokuzen-agenda setup` the
+(addresses masked), and the alert and snooze delays.
+
+Adding a calendar is a two-step gesture, borrowed from the clock's memento
+mori: the panel shows only an **＋ Add a calendar** button, and the address
+field appears when you press it. Paste, hit `Enter`, and the field is gone
+again — `Esc` drops it just as quickly. A secret iCal address is a long
+unreadable credential, and an input box sitting open with one in it gives it
+away to anyone glancing at your screen without buying you anything. Everything it writes goes through the same `mokuzen-agenda setup` the
 command line uses, so there is one config file and one notion of a valid
 setting.
 

@@ -97,9 +97,39 @@ BarWidget {
     }
   }
 
-  function togglePanel() { panel.visible = !panel.visible }
+  // The address field only exists while you are typing into it — the same
+  // shape as the clock's memento mori, which asks for a birth year on a
+  // double-tap and shows nothing otherwise. A secret iCal address is a long
+  // unreadable credential; leaving an input holding it open on the panel
+  // gives it away to anyone glancing at the screen and buys nothing.
+  property bool editingCalendar: false
+
+  function startEditingCalendar() {
+    editingCalendar = true
+    // Deferred: the field is only instantiated once `visible` turns true.
+    Qt.callLater(function() {
+      addressField.text = ""
+      addressField.forceActiveFocus()
+    })
+  }
+
+  function cancelEditingCalendar() {
+    addressField.text = ""
+    editingCalendar = false
+  }
+
+  function commitCalendar() {
+    var value = addressField.text.trim()
+    if (value.length > 0 && root.service) root.service.addCalendar(value)
+    cancelEditingCalendar()
+  }
+
+  function togglePanel() { panel.visible ? closePanel() : openPanel() }
   function openPanel() { panel.visible = true }
-  function closePanel() { panel.visible = false }
+  function closePanel() {
+    cancelEditingCalendar()
+    panel.visible = false
+  }
 
   // A bar surface exists per monitor, so several instances of this widget try
   // to claim the target; one wins and relays to its peers through the base's
@@ -121,7 +151,7 @@ BarWidget {
         if (root.service) root.service.refreshUpcoming()
         return
       }
-      panel.visible = !panel.visible
+      root.togglePanel()
     }
   }
 
@@ -143,7 +173,7 @@ BarWidget {
     // Anywhere outside the card dismisses.
     MouseArea {
       anchors.fill: parent
-      onClicked: panel.visible = false
+      onClicked: root.closePanel()
     }
 
     Rectangle {
@@ -162,7 +192,7 @@ BarWidget {
       // Swallow clicks so they do not reach the dismissing area behind.
       MouseArea { anchors.fill: parent }
 
-      Keys.onEscapePressed: panel.visible = false
+      Keys.onEscapePressed: root.editingCalendar ? root.cancelEditingCalendar() : root.closePanel()
 
       ColumnLayout {
         id: cardBody
@@ -269,10 +299,42 @@ BarWidget {
           Layout.fillWidth: true
           spacing: Style.space(8)
 
+          Rectangle {
+            id: addTrigger
+            visible: !root.editingCalendar
+            implicitWidth: addTriggerLabel.implicitWidth + Style.space(18)
+            implicitHeight: addTriggerLabel.implicitHeight + Style.space(11)
+            radius: Style.cornerRadius
+            color: "transparent"
+            border.width: 1
+            border.color: Color.popups.border
+
+            Text {
+              id: addTriggerLabel
+              anchors.centerIn: parent
+              text: root.calendars.length > 0 ? "＋  Add a calendar" : "＋  Add your calendar"
+              color: Color.popups.text
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.startEditingCalendar()
+            }
+          }
+
+          // Keeps the trigger its own width instead of stretching it across
+          // the card.
+          Item { Layout.fillWidth: true; visible: !root.editingCalendar }
+
           TextField {
             id: addressField
+            visible: root.editingCalendar
             Layout.fillWidth: true
-            placeholderText: "secret iCal address, .ics file, or folder"
+            placeholderText: "paste the address, then Enter"
+            Keys.onEscapePressed: root.cancelEditingCalendar()
             color: Color.popups.text
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -283,23 +345,18 @@ BarWidget {
               border.color: addressField.activeFocus ? Color.accent : Color.popups.border
               radius: Style.cornerRadius
             }
-            onAccepted: addButton.commit()
+            onAccepted: root.commitCalendar()
           }
 
           Rectangle {
             id: addButton
+            visible: root.editingCalendar
             implicitWidth: addLabel.implicitWidth + Style.space(18)
             implicitHeight: addressField.implicitHeight
             radius: Style.cornerRadius
             color: addressField.text.length > 0 ? Color.accent : "transparent"
             border.width: addressField.text.length > 0 ? 0 : 1
             border.color: Color.popups.border
-
-            function commit() {
-              if (!root.service || addressField.text.trim().length === 0) return
-              root.service.addCalendar(addressField.text.trim())
-              addressField.text = ""
-            }
 
             Text {
               id: addLabel
@@ -313,7 +370,7 @@ BarWidget {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: addButton.commit()
+              onClicked: root.commitCalendar()
             }
           }
         }
