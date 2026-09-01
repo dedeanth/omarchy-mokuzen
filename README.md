@@ -12,6 +12,7 @@ can miss.
 
 ```bash
 omarchy plugin add https://github.com/dedeanth/omarchy-mokuzen --enable
+omarchy bar put io.github.dedeanth.mokuzen --section right
 ```
 
 Then hand it your calendar. In Google Calendar, open *Settings for my
@@ -94,6 +95,42 @@ overlay says so rather than pretending your day is empty.
 | `ignoreTitles` | `[]` | Regular expressions; a matching title never alerts. |
 | `onlyWithLink` | `false` | Only alert for events that carry a meeting link. |
 | `enabled` | `true` | Set to `false` to keep the plugin installed but silent. |
+
+## In the bar
+
+The bar entry is the everyday face of Mokuzen: a calendar glyph and how long
+until the next meeting — `8h57`, `42m`, `<1m` — turning urgent as the alert
+approaches, and reading `set up` while no calendar is configured.
+
+| Interaction | Action |
+| --- | --- |
+| left click | open the panel |
+| middle click | refetch the agenda now |
+
+The panel shows the next three meetings, the calendars you have configured
+(addresses masked), a field to paste a new one, and the alert and snooze
+delays. Everything it writes goes through the same `mokuzen-agenda setup` the
+command line uses, so there is one config file and one notion of a valid
+setting.
+
+It also answers on the `mokuzen` IPC target, if you would rather bind a key:
+
+```bash
+omarchy-shell mokuzen toggle    # or open / close
+```
+
+Two settings live on the bar entry itself rather than in `mokuzen.json`,
+because they are about the bar and not about your calendar:
+
+```bash
+omarchy bar set io.github.dedeanth.mokuzen label time          # countdown | time | title
+omarchy bar set io.github.dedeanth.mokuzen hideWhenEmpty false --json
+```
+
+> Omarchy 4 renders no settings form for third-party widgets — `settingsForm`
+> takes built-in names and nothing consumes a plugin's `schema` — so the panel
+> above is Mokuzen's own. The `schema` block in the manifest is declared for
+> the day that changes.
 
 ## On screen
 

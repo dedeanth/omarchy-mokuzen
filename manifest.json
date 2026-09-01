@@ -8,11 +8,46 @@
   "description": "A fullscreen alert before every meeting, so the next one is impossible to miss.",
   "kinds": [
     "service",
-    "overlay"
+    "overlay",
+    "bar-widget"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml",
-    "overlay": "Overlay.qml"
+    "overlay": "Overlay.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Mokuzen",
+    "description": "What is next, when it starts, and where you paste your calendar address.",
+    "category": "Productivity",
+    "aliases": [
+      "mokuzen",
+      "meetings"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "label": "countdown",
+      "hideWhenEmpty": true
+    },
+    "schema": [
+      {
+        "key": "label",
+        "type": "enum",
+        "label": "Bar label",
+        "options": [
+          "countdown",
+          "time",
+          "title"
+        ],
+        "defaultValue": "countdown"
+      },
+      {
+        "key": "hideWhenEmpty",
+        "type": "boolean",
+        "label": "Hide when nothing is coming up",
+        "defaultValue": true
+      }
+    ]
   }
 }

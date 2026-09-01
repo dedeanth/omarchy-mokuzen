@@ -27,6 +27,8 @@ Item {
   property var config: ({})
 
   readonly property bool enabled: config.enabled !== false
+  // Mirrors what the agenda reader uses, so the bar can show and tune it.
+  readonly property int leadSeconds: Math.max(0, Number(config.leadSeconds) || 60)
   readonly property int pollSeconds: Math.max(10, Number(config.pollSeconds) || 30)
   readonly property int snoozeSeconds: Math.max(30, Number(config.snoozeSeconds) || 60)
   readonly property int autoDismissSeconds: Math.max(0, Number(config.autoDismissSeconds) || 0)
@@ -40,6 +42,12 @@ Item {
   property var currentEvent: null
   property string lastWarning: ""
   property bool checking: false
+
+  // What the bar widget shows: the next day of meetings, refreshed on the
+  // agenda cadence rather than the poll cadence.
+  property var upcoming: []
+  readonly property var calendars: Array.isArray(config.calendars) ? config.calendars : []
+  property bool busy: false
 
   // occurrenceId -> epoch seconds. Handled means "do not raise this again":
   // either the user dealt with it, or it is sleeping until a later moment.
@@ -162,6 +170,106 @@ Item {
 
     root.raise(event)
   }
+
+  // ---- what the bar widget needs -----------------------------------------
+
+  // A secret iCal address is a credential; the bar must never render one in
+  // full, and a shoulder-surfed screenshot must not give the calendar away.
+  function maskCalendar(source) {
+    var text = String(source || "")
+    if (!/^(https?|webcal):\/\//.test(text)) return text
+    var match = text.match(/^[a-z]+:\/\/([^\/]+)\/(.*)$/)
+    if (!match) return "remote calendar"
+    var tail = match[2].length > 10 ? match[2].slice(-10) : match[2]
+    return match[1] + "/…" + tail
+  }
+
+  function refreshUpcoming() {
+    if (!root.hasCalendars) {
+      root.upcoming = []
+      return
+    }
+    agendaList.running = true
+  }
+
+  Process {
+    id: agendaList
+    command: ["python3", root.agendaScript, "list", "--days", "1", "--limit", "20"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          root.upcoming = Array.isArray(parsed.events) ? parsed.events : []
+        } catch (e) {
+          root.upcoming = []
+        }
+      }
+    }
+  }
+
+  Timer {
+    interval: Math.max(60, root.pollSeconds * 4) * 1000
+    running: root.enabled && root.hasCalendars
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshUpcoming()
+  }
+
+  // ---- configuration, driven from the bar panel --------------------------
+  //
+  // Every write goes through the same `mokuzen-agenda setup` the command line
+  // uses, so there is one implementation of "what a valid config looks like"
+  // and one file to back up. The FileView above notices the result.
+
+  property var pendingConfigCommands: []
+
+  function runConfig(args) {
+    var queued = root.pendingConfigCommands.slice()
+    queued.push(args)
+    root.pendingConfigCommands = queued
+    if (!configProcess.running) startNextConfig()
+  }
+
+  function startNextConfig() {
+    if (root.pendingConfigCommands.length === 0) {
+      root.busy = false
+      return
+    }
+    var queued = root.pendingConfigCommands.slice()
+    var next = queued.shift()
+    root.pendingConfigCommands = queued
+    root.busy = true
+    configProcess.command = ["python3", root.agendaScript, "setup"].concat(next)
+    configProcess.running = true
+  }
+
+  Process {
+    id: configProcess
+    onExited: function(exitCode) {
+      // A non-zero exit here is usually "that address does not answer", which
+      // the panel surfaces; the write itself already happened.
+      root.startNextConfig()
+      if (root.pendingConfigCommands.length === 0) {
+        root.refreshUpcoming()
+        root.check()
+      }
+    }
+  }
+
+  function addCalendar(source) {
+    var trimmed = String(source || "").trim()
+    if (!trimmed) return
+    runConfig(["--calendar", trimmed])
+  }
+
+  function removeCalendar(source) {
+    if (!source) return
+    runConfig(["--remove-calendar", String(source), "--no-verify"])
+  }
+
+  function setLead(seconds) { runConfig(["--lead", String(Math.max(0, seconds)), "--no-verify"]) }
+  function setSnooze(seconds) { runConfig(["--snooze", String(Math.max(30, seconds)), "--no-verify"]) }
 
   Process {
     id: agendaCheck
