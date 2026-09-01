@@ -1,6 +1,6 @@
 # Mokuzen
 
-**目前 — "before the eyes."**
+**目前 — mokuzen, "right before your eyes."** ([why this name](#the-name))
 
 A fullscreen alert before every meeting, for [Omarchy](https://omarchy.org)'s
 Quickshell desktop. One minute before a calendar event starts, Mokuzen takes
@@ -200,6 +200,24 @@ you configured.
 - Omarchy 4 with its Quickshell shell
 - Python 3.9 or newer — standard library only, nothing to install
 - `xdg-open`, to open meeting links in your browser
+
+## The name
+
+**目前** is a Sino-Japanese compound: 目 *me*, the eye, and 前 *mae*, in front
+of. Read together in Japanese as **mokuzen**, it means *right before your
+eyes* — and, by extension, *imminent*: the thing that is about to happen, near
+enough that you cannot pretend not to see it.
+
+Which is the whole design brief in one word. A meeting alert has exactly one
+job, and every calendar notification fails at it the same way: it appears in a
+corner, politely, next to eleven other things asking for attention, and you
+scroll past it. Mokuzen takes the screen instead. Not because interrupting is
+pleasant, but because an alert you can miss is a meeting you can miss.
+
+The idea is not original — it is the model that [In Your
+Face](https://apps.apple.com/app/in-your-face/id1476964367) established on
+macOS. Mokuzen is that idea for Omarchy: no account, no service, no telemetry,
+one owner-only file, and a calendar it reads directly.
 
 ## License
 
