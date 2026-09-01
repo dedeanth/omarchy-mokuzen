@@ -1,12 +1,30 @@
 # Mokuzen
 
-**目前 — mokuzen, "right before your eyes."** ([why this name](#the-name))
+**目前 — mokuzen, "right before your eyes."**
 
-A fullscreen alert before every meeting, for [Omarchy](https://omarchy.org)'s
-Quickshell desktop. One minute before a calendar event starts, Mokuzen takes
-over the screen with the title, a live countdown, and one key to join the call.
-It is hard to ignore on purpose: a notification you can miss is a meeting you
-can miss.
+You have never missed a meeting because your computer failed to tell you. You
+missed it because it told you politely, in a corner, next to eleven other
+things, and you scrolled past.
+
+Mokuzen doesn't do polite. One minute before your meeting, it takes the whole
+screen: what's starting, how long you have, and one key to join. Then it gets
+out of the way.
+
+<p align="center">
+  <img src="preview.png" width="720" alt="The Mokuzen alert: a countdown, the meeting title, its time, and Join / Snooze / Dismiss">
+</p>
+
+- **It reads your calendar. That's it.** No account, no sync service, no
+  telemetry. Nothing leaves your machine except the request that fetches the
+  calendar you pointed it at.
+- **Nothing to install.** The whole calendar stack — iCalendar parsing,
+  recurrences, exceptions, time zones, meeting links — is Python standard
+  library.
+- **No background process of its own.** It runs inside the Omarchy shell
+  that's already there, and costs about a sixth of a second every half minute.
+- **One key to join.** Meet, Zoom, Teams, Webex, Whereby, Jitsi, Around,
+  Gather, Slack huddles — found in the location, the description, the `URL`,
+  or Google's conference field.
 
 ## Install
 
@@ -15,41 +33,118 @@ omarchy plugin add https://github.com/dedeanth/omarchy-mokuzen --enable
 omarchy bar put io.github.dedeanth.mokuzen --section right
 ```
 
-Then hand it your calendar. In Google Calendar, open *Settings for my
-calendars → Integrate calendar* and copy the **secret address in iCal format**,
-then:
+Then give it your calendar. In Google Calendar: *Settings for my calendars →
+Integrate calendar → **Secret address in iCal format***. Click **＋ Add a
+calendar** in the Mokuzen panel, paste, press `Enter`.
+
+That's the whole setup. Mokuzen fetches the calendar straight away and tells
+you how many events it found, so a wrong or revoked address fails in front of
+you rather than silently at 9:59am.
+
+## Configure
+
+Everything lives in one owner-only file, `~/.config/omarchy/mokuzen.json`.
+Three ways to write it, all equivalent — the panel and the command line go
+through the same code:
+
+**From the bar.** Click the Mokuzen entry. The panel holds your calendars
+(addresses masked), the alert and snooze delays, and the ＋ button.
+
+**From a terminal.**
 
 ```bash
 cd ~/.config/omarchy/plugins/io.github.dedeanth.mokuzen
-python3 bin/mokuzen-agenda setup --calendar "https://calendar.google.com/calendar/ical/…/basic.ics"
-```
-
-That writes `~/.config/omarchy/mokuzen.json` for you — creating it if needed,
-merging into it if it already exists — sets it owner-only, then immediately
-fetches the calendar and tells you how many events it found. A typo or a
-revoked address fails there and then, instead of silently at 9:59am.
-
-Repeat `--calendar` for as many calendars as you like, and tune the rest the
-same way:
-
-```bash
-python3 bin/mokuzen-agenda setup --calendar ~/.local/share/calendars/personal
+python3 bin/mokuzen-agenda setup --calendar "https://…/basic.ics"
 python3 bin/mokuzen-agenda setup --lead 120 --snooze 300
-python3 bin/mokuzen-agenda setup --show              # current settings, secret addresses masked
+python3 bin/mokuzen-agenda setup --show          # secrets masked
 python3 bin/mokuzen-agenda setup --remove-calendar "https://…"
 ```
 
-The shell watches the file: saved changes take effect immediately, with no
-restart. Until at least one calendar is configured, Mokuzen stays asleep and
-polls nothing.
+**By hand**, if you prefer — the file is plain JSON, and the shell picks up
+saved changes with no restart.
 
-`mokuzen.json.example` lists every key if you would rather write the file
-yourself.
+`calendars` takes any mix of: a secret iCal address, any other `.ics` URL
+(including `webcal://`), a local `.ics` file, or a **folder** — every `.ics`
+under it is read, which is how you point Mokuzen at a locally synced calendar.
+Remote ones are refetched every `refreshSeconds` and cached; when the network
+is down the cached copy is used, and Mokuzen says so rather than pretending
+your day is empty.
 
-> A secret iCal address is a credential — anyone holding it can read your
-> calendar. Mokuzen keeps `mokuzen.json` owner-only, and never prints an
-> address back in full: `setup --show`, `doctor`, and error messages all mask
-> it, so a pasted log or bug report does not hand your calendar away.
+<details>
+<summary><b>Every setting</b></summary>
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `calendars` | `[]` | URLs, files, or folders. Empty means Mokuzen does nothing. |
+| `leadSeconds` | `60` | How long before the start the alert appears. |
+| `pollSeconds` | `30` | How often the agenda is consulted. |
+| `refreshSeconds` | `300` | How often remote calendars are refetched. |
+| `snoozeSeconds` | `60` | How long the snooze key hides an alert. |
+| `graceSeconds` | `120` | An event that started longer ago than this is not raised. |
+| `autoDismissSeconds` | `0` | Close by itself this long after the start. `0` keeps it up. |
+| `ignoreAllDay` | `true` | Skip all-day events. |
+| `skipCancelled` | `true` | Skip cancelled events. |
+| `skipDeclined` | `true` | Skip events you declined — needs `selfEmails`. |
+| `selfEmails` | `[]` | Your addresses, used to recognise your own declines. |
+| `ignoreTitles` | `[]` | Regular expressions; a matching title never alerts. Good for recurring reminders that aren't meetings. |
+| `onlyWithLink` | `false` | Only alert for events that carry a meeting link. |
+| `enabled` | `true` | Keep the plugin installed but silent. |
+
+Two more live on the bar entry, because they're about the bar and not your
+calendar:
+
+```bash
+omarchy bar set io.github.dedeanth.mokuzen label time          # countdown | time | title
+omarchy bar set io.github.dedeanth.mokuzen hideWhenEmpty false --json
+```
+
+</details>
+
+## When it fires
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Join the meeting, then dismiss |
+| `S` | Snooze |
+| `Esc` | Dismiss until the meeting is over |
+
+Keystrokes are ignored for the first three-quarters of a second, so whatever
+you were typing when it appeared can't act on it by accident.
+
+## In the bar
+
+A calendar glyph and how long you have — `8h57`, `42m`, `<1m` — turning urgent
+as the alert approaches. Left click opens the panel, middle click refetches.
+It also answers on the `mokuzen` IPC target, if you'd rather bind a key:
+
+```bash
+omarchy-shell mokuzen toggle    # or open / close
+```
+
+Adding a calendar is deliberately a two-step gesture: the panel shows only a
+button, and the address field appears when you press it, then vanishes on
+`Enter`. A secret iCal address is a credential — an input box sitting open
+with one in it gives it away to anyone glancing at your screen, and buys you
+nothing.
+
+## Something wrong?
+
+The agenda reader is a plain command you can run yourself. Everything prints
+JSON.
+
+```bash
+cd ~/.config/omarchy/plugins/io.github.dedeanth.mokuzen
+python3 bin/mokuzen-agenda doctor         # what's configured, reachable, parseable
+python3 bin/mokuzen-agenda list --days 7  # what it thinks is coming
+python3 bin/mokuzen-agenda check          # what it would alert on right now
+qs log -p "$OMARCHY_PATH/shell" --tail 100
+```
+
+To see the alert without waiting for a meeting:
+
+```bash
+omarchy-shell shell summon io.github.dedeanth.mokuzen '{"summary":"Test","start":'"$(( $(date +%s) + 60 ))"',"end":'"$(( $(date +%s) + 1860 ))"',"occurrenceId":"test","link":""}'
+```
 
 ## Remove
 
@@ -59,165 +154,32 @@ rm -f ~/.config/omarchy/mokuzen.json
 rm -rf ~/.cache/mokuzen
 ```
 
-Mokuzen writes nothing else: no state in your shell configuration, no files
-outside those two paths.
-
-## Calendars
-
-`calendars` accepts, in any mix:
-
-- a secret iCal address (Google Calendar → *Settings for my calendars* →
-  *Integrate calendar* → *Secret address in iCal format*)
-- any other public or private `.ics` URL, including `webcal://`
-- a path to a local `.ics` file
-- a path to a directory, in which case every `.ics` file under it is read —
-  which is how you point Mokuzen at a locally synced calendar
-
-Remote calendars are fetched at most every `refreshSeconds` and cached under
-`~/.cache/mokuzen`. When the network is down the cached copy is used, and the
-overlay says so rather than pretending your day is empty.
-
-## Configuration
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `calendars` | `[]` | URLs, files, or directories. Empty means Mokuzen does nothing. |
-| `leadSeconds` | `60` | How long before the start the alert appears. |
-| `pollSeconds` | `30` | How often the agenda is consulted. |
-| `refreshSeconds` | `300` | How often remote calendars are refetched. |
-| `snoozeSeconds` | `60` | How long the snooze key hides an alert. |
-| `graceSeconds` | `120` | An event that started longer ago than this is not raised. |
-| `autoDismissSeconds` | `0` | Close by itself this long after the start. `0` keeps it up. |
-| `ignoreAllDay` | `true` | Skip all-day events. |
-| `skipCancelled` | `true` | Skip events with `STATUS:CANCELLED`. |
-| `skipDeclined` | `true` | Skip events you declined — needs `selfEmails`. |
-| `selfEmails` | `[]` | Your addresses, used to recognise your own declines. |
-| `ignoreTitles` | `[]` | Regular expressions; a matching title never alerts. |
-| `onlyWithLink` | `false` | Only alert for events that carry a meeting link. |
-| `enabled` | `true` | Set to `false` to keep the plugin installed but silent. |
-
-## In the bar
-
-The bar entry is the everyday face of Mokuzen: a calendar glyph and how long
-until the next meeting — `8h57`, `42m`, `<1m` — turning urgent as the alert
-approaches, and reading `set up` while no calendar is configured.
-
-| Interaction | Action |
-| --- | --- |
-| left click | open the panel |
-| middle click | refetch the agenda now |
-
-The panel shows the next three meetings, the calendars you have configured
-(addresses masked), and the alert and snooze delays.
-
-Adding a calendar is a two-step gesture, borrowed from the clock's memento
-mori: the panel shows only an **＋ Add a calendar** button, and the address
-field appears when you press it. Paste, hit `Enter`, and the field is gone
-again — `Esc` drops it just as quickly. A secret iCal address is a long
-unreadable credential, and an input box sitting open with one in it gives it
-away to anyone glancing at your screen without buying you anything. Everything it writes goes through the same `mokuzen-agenda setup` the
-command line uses, so there is one config file and one notion of a valid
-setting.
-
-It also answers on the `mokuzen` IPC target, if you would rather bind a key:
-
-```bash
-omarchy-shell mokuzen toggle    # or open / close
-```
-
-Two settings live on the bar entry itself rather than in `mokuzen.json`,
-because they are about the bar and not about your calendar:
-
-```bash
-omarchy bar set io.github.dedeanth.mokuzen label time          # countdown | time | title
-omarchy bar set io.github.dedeanth.mokuzen hideWhenEmpty false --json
-```
-
-> Omarchy 4 renders no settings form for third-party widgets — `settingsForm`
-> takes built-in names and nothing consumes a plugin's `schema` — so the panel
-> above is Mokuzen's own. The `schema` block in the manifest is declared for
-> the day that changes.
-
-## On screen
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Join the meeting in your browser, then dismiss |
-| `S` | Snooze for `snoozeSeconds` |
-| `Esc` | Dismiss until the meeting is over |
-
-Keystrokes are ignored for the first three-quarters of a second, so whatever
-you happened to be typing when the alert appeared cannot act on it by
-accident.
-
-Meeting links are recognised from the location, the description, the `URL`
-property, and Google's conference field, covering Meet, Zoom, Teams, Webex,
-Whereby, Jitsi, Around, Gather, and Slack huddles. Anything else falls back to
-the first link in the event.
-
-## Checking a setup
-
-The agenda reader is a plain command you can run yourself:
-
-```bash
-cd ~/.config/omarchy/plugins/io.github.dedeanth.mokuzen
-python3 bin/mokuzen-agenda doctor        # what is configured, reachable, parseable
-python3 bin/mokuzen-agenda list --days 7 # what it thinks is coming
-python3 bin/mokuzen-agenda check         # what it would alert on right now
-python3 bin/mokuzen-agenda refresh       # refetch remote calendars now
-python3 bin/mokuzen-agenda setup --show  # what is configured, secrets masked
-```
-
-Everything prints JSON. To watch the plugin itself:
-
-```bash
-qs log -p "$OMARCHY_PATH/shell" --tail 100
-```
-
-To see the overlay without waiting for a meeting:
-
-```bash
-omarchy-shell shell summon io.github.dedeanth.mokuzen '{"summary":"Test","start":'"$(( $(date +%s) + 60 ))"',"end":'"$(( $(date +%s) + 1860 ))"',"occurrenceId":"test","link":""}'
-```
+Mokuzen writes nothing outside those two paths.
 
 ## How it works
 
-Two entry points of one plugin, and no daemon of their own:
-
-- `Service.qml` runs inside the long-lived `omarchy-shell` process. Every
-  `pollSeconds` it runs `bin/mokuzen-agenda check` and, when something is
-  about to start, summons the overlay.
-- `Overlay.qml` is a layer-shell surface on the overlay layer, holding
-  keyboard focus while it is up.
-
-The shell hands the service instance to the overlay, so the two share state in
-memory. Nothing about your calendar is written to disk beyond the `.ics` cache,
-and nothing leaves your machine except the requests that fetch the calendars
-you configured.
-
-## Requirements
-
-- Omarchy 4 with its Quickshell shell
-- Python 3.9 or newer — standard library only, nothing to install
-- `xdg-open`, to open meeting links in your browser
+Three entry points of one plugin, all inside the long-lived `omarchy-shell`
+process. `Service.qml` asks `bin/mokuzen-agenda` what's about to start and
+summons the alert. `Overlay.qml` is the fullscreen layer-shell surface.
+`BarWidget.qml` is the bar entry and its panel. The shell hands the service to
+the other two, so they share state in memory — no files passed between halves,
+nothing about your calendar on disk beyond the `.ics` cache, which is
+owner-only like the config that fetched it.
 
 ## The name
 
-**目前** is a Sino-Japanese compound: 目 *me*, the eye, and 前 *mae*, in front
-of. Read together in Japanese as **mokuzen**, it means *right before your
-eyes* — and, by extension, *imminent*: the thing that is about to happen, near
-enough that you cannot pretend not to see it.
+**目前** is 目 *me*, the eye, and 前 *mae*, in front of. Read in Japanese as
+**mokuzen**: *right before your eyes*, and by extension *imminent* — the thing
+about to happen, near enough that you can't pretend not to see it.
 
-Which is the whole design brief in one word. A meeting alert has exactly one
-job, and every calendar notification fails at it the same way: it appears in a
-corner, politely, next to eleven other things asking for attention, and you
-scroll past it. Mokuzen takes the screen instead. Not because interrupting is
-pleasant, but because an alert you can miss is a meeting you can miss.
+Which is the entire design brief in one word. The idea isn't original: it's
+what [In Your Face](https://apps.apple.com/app/in-your-face/id1476964367)
+established on macOS. Mokuzen is that idea for Omarchy.
 
-The idea is not original — it is the model that [In Your
-Face](https://apps.apple.com/app/in-your-face/id1476964367) established on
-macOS. Mokuzen is that idea for Omarchy: no account, no service, no telemetry,
-one owner-only file, and a calendar it reads directly.
+## Requirements
+
+Omarchy 4 with its Quickshell shell · Python 3.9+ (standard library only) ·
+`xdg-open`
 
 ## License
 
