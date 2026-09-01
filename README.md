@@ -34,16 +34,19 @@ omarchy plugin add https://github.com/dedeanth/omarchy-mokuzen --enable
 omarchy bar put io.github.dedeanth.mokuzen --section right
 ```
 
-Then give it your calendar. Mokuzen speaks iCalendar, so it works with
-whatever you already use — find your `.ics` address:
+Then give it your calendar. Any calendar that can publish a private link
+works — which is all of them. Yours is here:
 
-| | Where |
+| | |
 | --- | --- |
-| **Google Calendar** | Settings for my calendars → Integrate calendar → *Secret address in iCal format* |
-| **Outlook / Microsoft 365** | Settings → Calendar → Shared calendars → Publish → *ICS* link |
-| **iCloud** | Calendar sidebar → share icon → Public Calendar → copy the `webcal://` link |
-| **Nextcloud / Proton / anything CalDAV** | the calendar's iCal export link — or point Mokuzen at a folder your CalDAV client already syncs |
-| **No cloud at all** | a local `.ics` file, or a folder of them |
+| **Google** | Settings for my calendars → Integrate calendar → **Secret** address in iCal format |
+| **Outlook / 365** | Settings → Calendar → Shared calendars → Publish → the ICS link |
+| **iCloud** | share icon next to the calendar → Public Calendar → the `webcal://` link |
+| **Nextcloud, Proton, any CalDAV** | the calendar's iCal export link — or just point Mokuzen at the folder your CalDAV client already syncs |
+| **No cloud at all** | an `.ics` file on disk, or a folder of them |
+
+On Google, take the **secret** address, not the public one: the public one
+only exists if you have made the calendar public, and it will be empty.
 
 Click **＋ Add a calendar** in the Mokuzen panel, paste, press `Enter`.
 
