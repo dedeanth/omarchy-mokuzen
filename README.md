@@ -14,16 +14,41 @@ can miss.
 omarchy plugin add https://github.com/dedeanth/omarchy-mokuzen --enable
 ```
 
-Then copy the sample configuration and point it at your calendars:
+Then hand it your calendar. In Google Calendar, open *Settings for my
+calendars → Integrate calendar* and copy the **secret address in iCal format**,
+then:
 
 ```bash
-cp ~/.config/omarchy/plugins/io.github.dedeanth.mokuzen/mokuzen.json.example ~/.config/omarchy/mokuzen.json
-$EDITOR ~/.config/omarchy/mokuzen.json
+cd ~/.config/omarchy/plugins/io.github.dedeanth.mokuzen
+python3 bin/mokuzen-agenda setup --calendar "https://calendar.google.com/calendar/ical/…/basic.ics"
 ```
 
-The shell watches that file: saved changes take effect immediately, with no
-restart. Until `calendars` has at least one entry, Mokuzen stays asleep and
+That writes `~/.config/omarchy/mokuzen.json` for you — creating it if needed,
+merging into it if it already exists — sets it owner-only, then immediately
+fetches the calendar and tells you how many events it found. A typo or a
+revoked address fails there and then, instead of silently at 9:59am.
+
+Repeat `--calendar` for as many calendars as you like, and tune the rest the
+same way:
+
+```bash
+python3 bin/mokuzen-agenda setup --calendar ~/.local/share/calendars/personal
+python3 bin/mokuzen-agenda setup --lead 120 --snooze 300
+python3 bin/mokuzen-agenda setup --show              # current settings, secret addresses masked
+python3 bin/mokuzen-agenda setup --remove-calendar "https://…"
+```
+
+The shell watches the file: saved changes take effect immediately, with no
+restart. Until at least one calendar is configured, Mokuzen stays asleep and
 polls nothing.
+
+`mokuzen.json.example` lists every key if you would rather write the file
+yourself.
+
+> A secret iCal address is a credential — anyone holding it can read your
+> calendar. Mokuzen keeps `mokuzen.json` owner-only, and never prints an
+> address back in full: `setup --show`, `doctor`, and error messages all mask
+> it, so a pasted log or bug report does not hand your calendar away.
 
 ## Remove
 
@@ -97,6 +122,7 @@ python3 bin/mokuzen-agenda doctor        # what is configured, reachable, parsea
 python3 bin/mokuzen-agenda list --days 7 # what it thinks is coming
 python3 bin/mokuzen-agenda check         # what it would alert on right now
 python3 bin/mokuzen-agenda refresh       # refetch remote calendars now
+python3 bin/mokuzen-agenda setup --show  # what is configured, secrets masked
 ```
 
 Everything prints JSON. To watch the plugin itself:

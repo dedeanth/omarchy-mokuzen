@@ -10,6 +10,7 @@ Commands:
     list      print upcoming occurrences, as JSON (for eyeballing a setup)
     refresh   refetch every remote calendar into the cache
     doctor    report what is configured, reachable, and parseable
+    setup     write the configuration file: add a calendar, set the lead time
 """
 
 from __future__ import annotations
@@ -89,6 +90,19 @@ def cache_dir() -> Path:
 # fetching
 
 
+def mask(source: str) -> str:
+    """A secret iCal address is a credential: anyone holding it reads the
+    calendar. Never echo one back in full."""
+    if not is_remote(source):
+        return source
+    match = re.match(r"^(https?://[^/]+/)(.*)$", normalize_url(source))
+    if not match:
+        return "<remote calendar>"
+    host, rest = match.groups()
+    tail = rest[-12:] if len(rest) > 12 else rest
+    return f"{host}…{tail}"
+
+
 def is_remote(source: str) -> bool:
     return source.startswith(("http://", "https://", "webcal://"))
 
@@ -127,13 +141,16 @@ def fetch_remote(source: str, max_age: int, force: bool = False) -> tuple[str, s
         os.replace(tmp, target)
         return text, None
     except (urllib.error.URLError, OSError, ValueError) as exc:
+        # Never echo the address itself: a secret iCal URL in a log line or a
+        # pasted bug report is the whole calendar handed over.
+        label = mask(source)
         if target.exists():
             try:
                 stale = target.read_text(encoding="utf-8", errors="replace")
-                return stale, f"{source}: unreachable ({exc}); using cached copy"
+                return stale, f"{label}: unreachable ({exc}); using cached copy"
             except OSError:
                 pass
-        return "", f"{source}: unreachable ({exc})"
+        return "", f"{label}: unreachable ({exc})"
 
 
 def read_source(source: str, max_age: int, force: bool = False) -> tuple[list[str], list[str]]:
@@ -616,6 +633,95 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
 
 
 # --------------------------------------------------------------------------
+# writing the configuration
+
+
+def write_config(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # The file holds secret calendar addresses; keep it to its owner.
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def cmd_setup(args) -> int:
+    path = config_path(args.config)
+    data: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except ValueError:
+            raise SystemExit(f"mokuzen: {path} is not valid JSON; fix or delete it first")
+
+    calendars = data.get("calendars")
+    if isinstance(calendars, str):
+        calendars = [calendars]
+    if not isinstance(calendars, list):
+        calendars = []
+
+    changed = False
+
+    for source in args.calendar or []:
+        if source in calendars:
+            print(f"already configured: {mask(source)}")
+            continue
+        calendars.append(source)
+        changed = True
+        print(f"added: {mask(source)}")
+
+    for source in args.remove_calendar or []:
+        if source in calendars:
+            calendars.remove(source)
+            changed = True
+            print(f"removed: {mask(source)}")
+        else:
+            print(f"not configured, nothing to remove: {mask(source)}")
+
+    if changed or "calendars" not in data:
+        data["calendars"] = calendars
+
+    for key, value in (
+        ("leadSeconds", args.lead),
+        ("pollSeconds", args.poll),
+        ("snoozeSeconds", args.snooze),
+    ):
+        if value is not None:
+            data[key] = value
+            changed = True
+            print(f"set {key} = {value}")
+
+    if args.show or not changed:
+        shown = dict(data)
+        shown["calendars"] = [mask(str(c)) for c in calendars]
+        print(f"\n{path}")
+        print(json.dumps(shown, indent=2, ensure_ascii=False))
+        if not changed:
+            return 0
+
+    write_config(path, data)
+    print(f"\nwrote {path} (owner-only)")
+
+    if args.no_verify:
+        return 0
+
+    # A secret address that 404s is the failure people actually hit, and they
+    # hit it silently. Say so now rather than at 9:59am.
+    problems = 0
+    for source in calendars:
+        documents, warnings = read_source(str(source), 0, force=True)
+        count = sum(len(split_events(document)) for document in documents)
+        if warnings or not documents:
+            problems += 1
+            print(f"  ✗ {warnings[0] if warnings else mask(str(source)) + ': nothing readable'}")
+        else:
+            print(f"  ✓ {mask(str(source))}: {count} events")
+    return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------
 # commands
 
 
@@ -705,6 +811,22 @@ def main(argv: list[str]) -> int:
 
     doctor = sub.add_parser("doctor", help="report configuration health")
     doctor.set_defaults(func=cmd_doctor)
+
+    setup = sub.add_parser("setup", help="write the configuration file")
+    setup.add_argument(
+        "--calendar", action="append", metavar="URL_OR_PATH",
+        help="add a calendar: a secret iCal address, an .ics file, or a directory. Repeatable.",
+    )
+    setup.add_argument(
+        "--remove-calendar", action="append", metavar="URL_OR_PATH",
+        help="remove a calendar previously added. Repeatable.",
+    )
+    setup.add_argument("--lead", type=int, metavar="SECONDS", help="how long before the start the alert appears")
+    setup.add_argument("--poll", type=int, metavar="SECONDS", help="how often the agenda is consulted")
+    setup.add_argument("--snooze", type=int, metavar="SECONDS", help="how long the snooze key hides an alert")
+    setup.add_argument("--show", action="store_true", help="print the resulting configuration, secrets masked")
+    setup.add_argument("--no-verify", action="store_true", help="skip fetching the calendars afterwards")
+    setup.set_defaults(func=cmd_setup)
 
     args = parser.parse_args(argv)
     return args.func(args)
