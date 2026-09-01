@@ -14,9 +14,10 @@ out of the way.
   <img src="preview.png" width="720" alt="The Mokuzen alert: a countdown, the meeting title, its time, and Join / Snooze / Dismiss">
 </p>
 
-- **It reads your calendar. That's it.** No account, no sync service, no
-  telemetry. Nothing leaves your machine except the request that fetches the
-  calendar you pointed it at.
+- **It reads your calendar. That's it.** Google, Outlook, iCloud, Nextcloud,
+  or a folder of `.ics` files on disk — anything that speaks iCalendar. No
+  account, no sync service, no telemetry. Nothing leaves your machine except
+  the request that fetches the calendar you pointed it at.
 - **Nothing to install.** The whole calendar stack — iCalendar parsing,
   recurrences, exceptions, time zones, meeting links — is Python standard
   library.
@@ -33,9 +34,18 @@ omarchy plugin add https://github.com/dedeanth/omarchy-mokuzen --enable
 omarchy bar put io.github.dedeanth.mokuzen --section right
 ```
 
-Then give it your calendar. In Google Calendar: *Settings for my calendars →
-Integrate calendar → **Secret address in iCal format***. Click **＋ Add a
-calendar** in the Mokuzen panel, paste, press `Enter`.
+Then give it your calendar. Mokuzen speaks iCalendar, so it works with
+whatever you already use — find your `.ics` address:
+
+| | Where |
+| --- | --- |
+| **Google Calendar** | Settings for my calendars → Integrate calendar → *Secret address in iCal format* |
+| **Outlook / Microsoft 365** | Settings → Calendar → Shared calendars → Publish → *ICS* link |
+| **iCloud** | Calendar sidebar → share icon → Public Calendar → copy the `webcal://` link |
+| **Nextcloud / Proton / anything CalDAV** | the calendar's iCal export link — or point Mokuzen at a folder your CalDAV client already syncs |
+| **No cloud at all** | a local `.ics` file, or a folder of them |
+
+Click **＋ Add a calendar** in the Mokuzen panel, paste, press `Enter`.
 
 That's the whole setup. Mokuzen fetches the calendar straight away and tells
 you how many events it found, so a wrong or revoked address fails in front of
@@ -63,12 +73,11 @@ python3 bin/mokuzen-agenda setup --remove-calendar "https://…"
 **By hand**, if you prefer — the file is plain JSON, and the shell picks up
 saved changes with no restart.
 
-`calendars` takes any mix of: a secret iCal address, any other `.ics` URL
-(including `webcal://`), a local `.ics` file, or a **folder** — every `.ics`
-under it is read, which is how you point Mokuzen at a locally synced calendar.
-Remote ones are refetched every `refreshSeconds` and cached; when the network
-is down the cached copy is used, and Mokuzen says so rather than pretending
-your day is empty.
+`calendars` takes as many sources as you like, mixed freely — work in one,
+personal in another. A folder counts as one source: every `.ics` under it is
+read. Remote ones are refetched every `refreshSeconds` and cached; when the
+network is down the cached copy is used, and Mokuzen says so rather than
+pretending your day is empty.
 
 <details>
 <summary><b>Every setting</b></summary>
