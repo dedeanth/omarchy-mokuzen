@@ -83,7 +83,21 @@ def cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     path = Path(base) / "mokuzen"
     path.mkdir(parents=True, exist_ok=True)
+    # The cache holds the calendar itself — every title, every attendee. It is
+    # exactly as private as the address that fetched it.
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
     return path
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write owner-only, atomically."""
+    tmp = path.with_suffix(path.suffix + ".part")
+    tmp.write_text(text, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------
@@ -136,9 +150,7 @@ def fetch_remote(source: str, max_age: int, force: bool = False) -> tuple[str, s
         with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT) as response:
             raw = response.read()
         text = raw.decode("utf-8", errors="replace")
-        tmp = target.with_suffix(".part")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
+        write_private(target, text)
         return text, None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         # Never echo the address itself: a secret iCal URL in a log line or a
@@ -722,6 +734,73 @@ def cmd_setup(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# the poll cache
+
+
+OCCURRENCE_HORIZON = timedelta(hours=24)
+
+
+def occurrence_cache_path() -> Path:
+    return cache_dir() / "occurrences.json"
+
+
+def config_fingerprint(cfg: dict) -> str:
+    relevant = {
+        key: cfg.get(key)
+        for key in (
+            "calendars", "ignoreAllDay", "skipCancelled", "skipDeclined",
+            "selfEmails", "ignoreTitles", "onlyWithLink",
+        )
+    }
+    blob = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
+    """Expanding a real calendar costs the best part of a second — a 6 MB
+    export with ten thousand events is not unusual. The poll that asks "is
+    anything due right now" runs every 30s and must not pay that. So the
+    expansion happens on the refresh cadence and lands in a small file the
+    poll can read; only the countdown is recomputed against the clock.
+
+    The fingerprint covers every setting that changes which events matter, so
+    editing the configuration takes effect on the next poll rather than
+    whenever the cache happens to expire.
+    """
+    path = occurrence_cache_path()
+    fingerprint = config_fingerprint(cfg)
+    max_age = max(30, int(cfg.get("refreshSeconds", 300)))
+
+    if not force:
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            usable = (
+                cached.get("fingerprint") == fingerprint
+                and now.timestamp() - float(cached.get("computed", 0)) < max_age
+                # Never serve a horizon that is about to run out from under us.
+                and float(cached.get("horizonEnd", 0)) > now.timestamp() + 3600
+            )
+            if usable:
+                return cached.get("events", []), cached.get("warnings", []), True
+        except (OSError, ValueError, TypeError):
+            pass
+
+    items, warnings = occurrences(cfg, now, OCCURRENCE_HORIZON, force_refresh=force)
+    payload = {
+        "fingerprint": fingerprint,
+        "computed": int(now.timestamp()),
+        "horizonEnd": int((now + OCCURRENCE_HORIZON).timestamp()),
+        "events": items,
+        "warnings": warnings,
+    }
+    try:
+        write_private(path, json.dumps(payload))
+    except OSError:
+        pass
+    return items, warnings, False
+
+
+# --------------------------------------------------------------------------
 # commands
 
 
@@ -729,12 +808,21 @@ def cmd_check(args) -> int:
     cfg = load_config(args.config)
     now = datetime.now(timezone.utc).astimezone()
     lead = args.window if args.window is not None else int(cfg.get("leadSeconds", 60))
-    items, warnings = occurrences(cfg, now, timedelta(seconds=max(lead, 60) + 60))
+    items, warnings, from_cache = cached_occurrences(cfg, now)
 
-    upcoming = [item for item in items if -60 <= item["startsIn"] <= lead]
+    upcoming = []
+    for item in items:
+        starts_in = int(float(item["start"]) - now.timestamp())
+        if -60 <= starts_in <= lead:
+            fresh = dict(item)
+            fresh["startsIn"] = starts_in
+            upcoming.append(fresh)
+    upcoming.sort(key=lambda entry: entry["start"])
+
     payload = {
         "now": int(now.timestamp()),
         "leadSeconds": lead,
+        "cached": from_cache,
         "event": upcoming[0] if upcoming else None,
         "warnings": warnings,
     }
@@ -754,8 +842,16 @@ def cmd_list(args) -> int:
 
 def cmd_refresh(args) -> int:
     cfg = load_config(args.config)
-    _, warnings = collect(cfg, force_refresh=True)
-    json.dump({"refreshed": len(cfg.get("calendars", [])), "warnings": warnings}, sys.stdout)
+    now = datetime.now(timezone.utc).astimezone()
+    items, warnings, _ = cached_occurrences(cfg, now, force=True)
+    json.dump(
+        {
+            "refreshed": len(cfg.get("calendars", [])),
+            "upcoming": len(items),
+            "warnings": warnings,
+        },
+        sys.stdout,
+    )
     sys.stdout.write("\n")
     return 1 if warnings else 0
 
