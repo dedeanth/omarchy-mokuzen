@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""Read calendars, answer one question: what is about to start?
+
+Standard library only, on purpose. Mokuzen runs inside the Omarchy shell
+process on someone else's machine; every dependency it does not have is one
+less thing that can be missing, stale, or surprising at 9:59am.
+
+Commands:
+    check     print the next occurrence inside the lead window, as JSON
+    list      print upcoming occurrences, as JSON (for eyeballing a setup)
+    refresh   refetch every remote calendar into the cache
+    doctor    report what is configured, reachable, and parseable
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar as _calendar
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
+
+USER_AGENT = "mokuzen/1.0 (+https://github.com/dedeanth/omarchy-mokuzen)"
+NETWORK_TIMEOUT = 20
+
+DEFAULTS = {
+    "calendars": [],
+    "leadSeconds": 60,
+    "pollSeconds": 30,
+    "refreshSeconds": 300,
+    "lookaheadDays": 30,
+    "ignoreAllDay": True,
+    "skipCancelled": True,
+    "skipDeclined": True,
+    "selfEmails": [],
+    "ignoreTitles": [],
+    "onlyWithLink": False,
+}
+
+
+# --------------------------------------------------------------------------
+# configuration
+
+
+def config_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "omarchy" / "mokuzen.json"
+
+
+def load_config(explicit: str | None) -> dict:
+    path = config_path(explicit)
+    cfg = dict(DEFAULTS)
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"mokuzen: cannot read {path}: {exc}")
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"mokuzen: {path} must contain a JSON object")
+        cfg.update(loaded)
+    cfg["_path"] = str(path)
+    cfg["_exists"] = path.exists()
+    if isinstance(cfg.get("calendars"), str):
+        cfg["calendars"] = [cfg["calendars"]]
+    return cfg
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    path = Path(base) / "mokuzen"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# --------------------------------------------------------------------------
+# fetching
+
+
+def is_remote(source: str) -> bool:
+    return source.startswith(("http://", "https://", "webcal://"))
+
+
+def normalize_url(source: str) -> str:
+    if source.startswith("webcal://"):
+        return "https://" + source[len("webcal://"):]
+    return source
+
+
+def cache_file(source: str) -> Path:
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    return cache_dir() / f"{digest}.ics"
+
+
+def fetch_remote(source: str, max_age: int, force: bool = False) -> tuple[str, str | None]:
+    """Return (text, warning). Stale cache beats no calendar at all."""
+    target = cache_file(source)
+    fresh_enough = False
+    if target.exists() and not force:
+        age = max(0.0, datetime.now().timestamp() - target.stat().st_mtime)
+        fresh_enough = age < max(0, max_age)
+    if fresh_enough:
+        try:
+            return target.read_text(encoding="utf-8", errors="replace"), None
+        except OSError:
+            pass
+
+    request = urllib.request.Request(normalize_url(source), headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT) as response:
+            raw = response.read()
+        text = raw.decode("utf-8", errors="replace")
+        tmp = target.with_suffix(".part")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+        return text, None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        if target.exists():
+            try:
+                stale = target.read_text(encoding="utf-8", errors="replace")
+                return stale, f"{source}: unreachable ({exc}); using cached copy"
+            except OSError:
+                pass
+        return "", f"{source}: unreachable ({exc})"
+
+
+def read_source(source: str, max_age: int, force: bool = False) -> tuple[list[str], list[str]]:
+    """Return (list of ICS documents, warnings)."""
+    if is_remote(source):
+        text, warning = fetch_remote(source, max_age, force)
+        return ([text] if text else []), ([warning] if warning else [])
+
+    path = Path(source).expanduser()
+    if path.is_dir():
+        documents, warnings = [], []
+        for child in sorted(path.rglob("*.ics")):
+            try:
+                documents.append(child.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                warnings.append(f"{child}: {exc}")
+        return documents, warnings
+    if path.is_file():
+        try:
+            return [path.read_text(encoding="utf-8", errors="replace")], []
+        except OSError as exc:
+            return [], [f"{path}: {exc}"]
+    return [], [f"{source}: no such file or directory"]
+
+
+# --------------------------------------------------------------------------
+# iCalendar parsing
+
+
+def unfold(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def parse_line(line: str) -> tuple[str, dict, str] | None:
+    if not line or ":" not in line:
+        return None
+    head, value = line.split(":", 1)
+    parts = head.split(";")
+    name = parts[0].upper()
+    params: dict[str, str] = {}
+    for chunk in parts[1:]:
+        if "=" in chunk:
+            key, val = chunk.split("=", 1)
+            params[key.upper()] = val.strip('"')
+    return name, params, value
+
+
+def unescape(value: str) -> str:
+    out = value.replace("\\n", "\n").replace("\\N", "\n")
+    out = out.replace("\\,", ",").replace("\\;", ";")
+    return out.replace("\\\\", "\\")
+
+
+def zone_for(tzid: str | None):
+    if not tzid or ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(tzid)
+    except Exception:
+        return None
+
+
+def local_zone():
+    return datetime.now().astimezone().tzinfo
+
+
+def parse_dt(value: str, params: dict) -> tuple[datetime | date | None, bool]:
+    """Return (value, is_all_day). Floating times are read as local."""
+    value = value.strip()
+    if not value:
+        return None, False
+    if params.get("VALUE", "").upper() == "DATE" or (len(value) == 8 and "T" not in value):
+        try:
+            return datetime.strptime(value, "%Y%m%d").date(), True
+        except ValueError:
+            return None, False
+    try:
+        if value.endswith("Z"):
+            naive = datetime.strptime(value[:-1], "%Y%m%dT%H%M%S")
+            return naive.replace(tzinfo=timezone.utc), False
+        naive = datetime.strptime(value, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None, False
+    zone = zone_for(params.get("TZID")) or local_zone()
+    return naive.replace(tzinfo=zone), False
+
+
+def parse_duration(value: str) -> timedelta | None:
+    match = re.fullmatch(
+        r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
+        value.strip().upper(),
+    )
+    if not match:
+        return None
+    sign = -1 if match.group(1) == "-" else 1
+    weeks, days, hours, minutes, seconds = (int(g or 0) for g in match.groups()[1:])
+    return sign * timedelta(weeks=weeks, days=days, hours=hours, minutes=minutes, seconds=seconds)
+
+
+def split_events(text: str) -> list[list[str]]:
+    events, current = [], None
+    for line in unfold(text):
+        stripped = line.strip()
+        if stripped == "BEGIN:VEVENT":
+            current = []
+        elif stripped == "END:VEVENT":
+            if current is not None:
+                events.append(current)
+            current = None
+        elif current is not None:
+            current.append(line)
+    return events
+
+
+def parse_event(lines: list[str], calendar_name: str) -> dict | None:
+    event: dict = {
+        "uid": "",
+        "summary": "",
+        "location": "",
+        "description": "",
+        "url": "",
+        "status": "",
+        "calendar": calendar_name,
+        "rrule": "",
+        "exdates": [],
+        "recurrence_id": None,
+        "declined": False,
+        "conference": "",
+    }
+    start = end = None
+    all_day = False
+    duration = None
+
+    for line in lines:
+        parsed = parse_line(line)
+        if not parsed:
+            continue
+        name, params, value = parsed
+        if name == "UID":
+            event["uid"] = value.strip()
+        elif name == "SUMMARY":
+            event["summary"] = unescape(value).strip()
+        elif name == "LOCATION":
+            event["location"] = unescape(value).strip()
+        elif name == "DESCRIPTION":
+            event["description"] = unescape(value)
+        elif name == "URL":
+            event["url"] = value.strip()
+        elif name == "STATUS":
+            event["status"] = value.strip().upper()
+        elif name == "X-GOOGLE-CONFERENCE":
+            event["conference"] = value.strip()
+        elif name == "DTSTART":
+            start, all_day = parse_dt(value, params)
+        elif name == "DTEND":
+            end, _ = parse_dt(value, params)
+        elif name == "DURATION":
+            duration = parse_duration(value)
+        elif name == "RRULE":
+            event["rrule"] = value.strip()
+        elif name == "EXDATE":
+            for chunk in value.split(","):
+                excluded, _ = parse_dt(chunk, params)
+                if excluded is not None:
+                    event["exdates"].append(excluded)
+        elif name == "RECURRENCE-ID":
+            recurrence, _ = parse_dt(value, params)
+            event["recurrence_id"] = recurrence
+        elif name == "ATTENDEE":
+            if params.get("PARTSTAT", "").upper() == "DECLINED":
+                event.setdefault("declined_addresses", []).append(value.strip().lower())
+
+    if start is None:
+        return None
+
+    if end is None:
+        if duration is not None:
+            end = start + duration
+        elif all_day:
+            end = start + timedelta(days=1)
+        else:
+            end = start + timedelta(hours=1)
+
+    event["start"] = start
+    event["end"] = end
+    event["all_day"] = all_day
+    return event
+
+
+# --------------------------------------------------------------------------
+# recurrence
+
+
+WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def parse_rrule(rule: str) -> dict:
+    parsed: dict = {}
+    for chunk in rule.split(";"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        parsed[key.upper()] = value.upper()
+    return parsed
+
+
+def byday_matches(day: date, tokens: list[str], freq: str) -> bool:
+    for token in tokens:
+        match = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", token)
+        if not match:
+            continue
+        ordinal, name = match.groups()
+        if day.weekday() != WEEKDAYS[name]:
+            continue
+        if not ordinal:
+            return True
+        position = int(ordinal)
+        if freq == "MONTHLY":
+            first, days_in_month = 1, _calendar.monthrange(day.year, day.month)[1]
+            same = [
+                d for d in range(first, days_in_month + 1)
+                if date(day.year, day.month, d).weekday() == day.weekday()
+            ]
+        else:  # YEARLY
+            same = []
+            for month in range(1, 13):
+                for d in range(1, _calendar.monthrange(day.year, month)[1] + 1):
+                    candidate = date(day.year, month, d)
+                    if candidate.weekday() == day.weekday():
+                        same.append(candidate)
+            index = same.index(day) + 1
+            return index == position if position > 0 else index == len(same) + position + 1
+        index = same.index(day.day) + 1
+        if position > 0 and index == position:
+            return True
+        if position < 0 and index == len(same) + position + 1:
+            return True
+    return False
+
+
+def day_matches(day: date, rule: dict, seed: date) -> bool:
+    freq = rule.get("FREQ", "")
+    interval = max(1, int(rule.get("INTERVAL", "1") or 1))
+
+    months = [int(m) for m in rule["BYMONTH"].split(",")] if rule.get("BYMONTH") else None
+    if months and day.month not in months:
+        return False
+
+    monthdays = [int(m) for m in rule["BYMONTHDAY"].split(",")] if rule.get("BYMONTHDAY") else None
+    if monthdays:
+        days_in_month = _calendar.monthrange(day.year, day.month)[1]
+        wanted = {d if d > 0 else days_in_month + d + 1 for d in monthdays}
+        if day.day not in wanted:
+            return False
+
+    bydays = rule["BYDAY"].split(",") if rule.get("BYDAY") else None
+
+    if freq == "DAILY":
+        if (day - seed).days % interval:
+            return False
+        return byday_matches(day, bydays, freq) if bydays else True
+
+    if freq == "WEEKLY":
+        seed_week = seed - timedelta(days=seed.weekday())
+        day_week = day - timedelta(days=day.weekday())
+        if ((day_week - seed_week).days // 7) % interval:
+            return False
+        if bydays:
+            return byday_matches(day, bydays, freq)
+        return day.weekday() == seed.weekday()
+
+    if freq == "MONTHLY":
+        months_apart = (day.year - seed.year) * 12 + (day.month - seed.month)
+        if months_apart % interval:
+            return False
+        if bydays:
+            return byday_matches(day, bydays, freq)
+        if monthdays:
+            return True
+        return day.day == seed.day
+
+    if freq == "YEARLY":
+        if (day.year - seed.year) % interval:
+            return False
+        if bydays:
+            return byday_matches(day, bydays, freq)
+        if monthdays or months:
+            return True
+        return (day.month, day.day) == (seed.month, seed.day)
+
+    return False
+
+
+def expand(event: dict, window_start: datetime, window_end: datetime) -> list[datetime]:
+    """Occurrence start times inside the window."""
+    start = event["start"]
+    is_date = isinstance(start, date) and not isinstance(start, datetime)
+    seed_date = start if is_date else start.date()
+    seed_time = None if is_date else start.timetz()
+
+    def materialize(day: date) -> datetime:
+        if is_date:
+            return datetime.combine(day, dtime(0, 0), tzinfo=local_zone())
+        return datetime.combine(day, seed_time)
+
+    if not event["rrule"]:
+        occurrence = materialize(seed_date)
+        return [occurrence] if window_start <= occurrence <= window_end else []
+
+    rule = parse_rrule(event["rrule"])
+    count = int(rule["COUNT"]) if rule.get("COUNT", "").isdigit() else None
+    until = None
+    if rule.get("UNTIL"):
+        parsed_until, _ = parse_dt(rule["UNTIL"], {})
+        if isinstance(parsed_until, datetime):
+            until = parsed_until
+        elif isinstance(parsed_until, date):
+            until = datetime.combine(parsed_until, dtime(23, 59, 59), tzinfo=local_zone())
+
+    excluded = set()
+    for item in event["exdates"]:
+        excluded.add(item if isinstance(item, date) and not isinstance(item, datetime) else item.date())
+
+    # COUNT is relative to the first occurrence, so it forces a walk from the
+    # seed. Everything else can start at the window and stay cheap.
+    cursor = seed_date if count else max(seed_date, window_start.date() - timedelta(days=1))
+    last_day = window_end.date()
+    seen = 0
+    found: list[datetime] = []
+
+    while cursor <= last_day:
+        if day_matches(cursor, rule, seed_date) and cursor >= seed_date:
+            seen += 1
+            if count and seen > count:
+                break
+            occurrence = materialize(cursor)
+            if until and occurrence > until:
+                break
+            if cursor not in excluded and window_start <= occurrence <= window_end:
+                found.append(occurrence)
+        cursor += timedelta(days=1)
+
+    return found
+
+
+# --------------------------------------------------------------------------
+# meeting links
+
+
+LINK_PATTERNS = [
+    r"https://[a-z0-9.-]*meet\.google\.com/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*zoom\.us/j/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*zoom\.us/my/[^\s<>\"']+",
+    r"https://teams\.microsoft\.com/l/meetup-join/[^\s<>\"']+",
+    r"https://teams\.live\.com/meet/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*webex\.com/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*whereby\.com/[^\s<>\"']+",
+    r"https://meet\.jit\.si/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*around\.co/[^\s<>\"']+",
+    r"https://app\.gather\.town/[^\s<>\"']+",
+    r"https://[a-z0-9.-]*slack\.com/[^\s<>\"']*huddle[^\s<>\"']*",
+]
+
+
+def find_link(event: dict) -> str:
+    haystacks = [
+        event.get("conference", ""),
+        event.get("location", ""),
+        event.get("url", ""),
+        event.get("description", ""),
+    ]
+    for pattern in LINK_PATTERNS:
+        for text in haystacks:
+            if not text:
+                continue
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0).rstrip(".,);")
+    for text in haystacks:
+        match = re.search(r"https://[^\s<>\"']+", text or "")
+        if match:
+            return match.group(0).rstrip(".,);")
+    return ""
+
+
+# --------------------------------------------------------------------------
+# collection
+
+
+def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[str]]:
+    sources = cfg.get("calendars") or []
+    warnings: list[str] = []
+    events: list[dict] = []
+    overrides: dict[tuple[str, str], dict] = {}
+
+    for source in sources:
+        documents, source_warnings = read_source(
+            str(source), int(cfg.get("refreshSeconds", 300)), force_refresh
+        )
+        warnings.extend(source_warnings)
+        label = Path(str(source)).name if not is_remote(str(source)) else "remote"
+        for document in documents:
+            for lines in split_events(document):
+                event = parse_event(lines, label)
+                if event is None:
+                    continue
+                if event["recurrence_id"] is not None:
+                    key = (event["uid"], str(event["recurrence_id"]))
+                    overrides[key] = event
+                events.append(event)
+
+    return events, warnings
+
+
+def wanted(event: dict, cfg: dict) -> bool:
+    if cfg.get("skipCancelled", True) and event.get("status") == "CANCELLED":
+        return False
+    if cfg.get("ignoreAllDay", True) and event.get("all_day"):
+        return False
+    if cfg.get("skipDeclined", True):
+        mine = {str(a).lower() for a in cfg.get("selfEmails", [])}
+        declined = {
+            address.replace("mailto:", "") for address in event.get("declined_addresses", [])
+        }
+        if mine and (mine & declined):
+            return False
+    for pattern in cfg.get("ignoreTitles", []):
+        try:
+            if re.search(str(pattern), event.get("summary", ""), re.IGNORECASE):
+                return False
+        except re.error:
+            continue
+    return True
+
+
+def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: bool = False):
+    events, warnings = collect(cfg, force_refresh)
+    window_start = now - timedelta(minutes=5)
+    window_end = now + horizon
+
+    overridden: set[tuple[str, str]] = set()
+    for event in events:
+        if event["recurrence_id"] is not None:
+            overridden.add((event["uid"], str(event["recurrence_id"])))
+
+    out = []
+    for event in events:
+        if not wanted(event, cfg):
+            continue
+        for start in expand(event, window_start, window_end):
+            if event["recurrence_id"] is None and (event["uid"], str(start)) in overridden:
+                continue
+            length = event["end"] - event["start"] if not event["all_day"] else timedelta(days=1)
+            link = find_link(event)
+            if cfg.get("onlyWithLink") and not link:
+                continue
+            out.append(
+                {
+                    "uid": event["uid"],
+                    "occurrenceId": f"{event['uid']}@{int(start.timestamp())}",
+                    "summary": event["summary"] or "(no title)",
+                    "location": event["location"],
+                    "link": link,
+                    "calendar": event["calendar"],
+                    "allDay": event["all_day"],
+                    "start": int(start.timestamp()),
+                    "end": int((start + length).timestamp()),
+                    "startsIn": int((start - now).total_seconds()),
+                }
+            )
+
+    out.sort(key=lambda item: item["start"])
+    return out, warnings
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def cmd_check(args) -> int:
+    cfg = load_config(args.config)
+    now = datetime.now(timezone.utc).astimezone()
+    lead = args.window if args.window is not None else int(cfg.get("leadSeconds", 60))
+    items, warnings = occurrences(cfg, now, timedelta(seconds=max(lead, 60) + 60))
+
+    upcoming = [item for item in items if -60 <= item["startsIn"] <= lead]
+    payload = {
+        "now": int(now.timestamp()),
+        "leadSeconds": lead,
+        "event": upcoming[0] if upcoming else None,
+        "warnings": warnings,
+    }
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_list(args) -> int:
+    cfg = load_config(args.config)
+    now = datetime.now(timezone.utc).astimezone()
+    items, warnings = occurrences(cfg, now, timedelta(days=args.days))
+    json.dump({"events": items[: args.limit], "warnings": warnings}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_refresh(args) -> int:
+    cfg = load_config(args.config)
+    _, warnings = collect(cfg, force_refresh=True)
+    json.dump({"refreshed": len(cfg.get("calendars", [])), "warnings": warnings}, sys.stdout)
+    sys.stdout.write("\n")
+    return 1 if warnings else 0
+
+
+def cmd_doctor(args) -> int:
+    cfg = load_config(args.config)
+    now = datetime.now(timezone.utc).astimezone()
+    report = {
+        "config": cfg["_path"],
+        "configExists": cfg["_exists"],
+        "cacheDir": str(cache_dir()),
+        "calendars": [],
+        "warnings": [],
+    }
+    for source in cfg.get("calendars", []):
+        documents, warnings = read_source(str(source), int(cfg.get("refreshSeconds", 300)))
+        count = sum(len(split_events(document)) for document in documents)
+        report["calendars"].append(
+            {
+                "source": ("<remote>" if is_remote(str(source)) else str(source)),
+                "remote": is_remote(str(source)),
+                "documents": len(documents),
+                "events": count,
+                "ok": bool(documents) and not warnings,
+            }
+        )
+        report["warnings"].extend(warnings)
+    items, more = occurrences(cfg, now, timedelta(days=7))
+    report["warnings"].extend(more)
+    report["next7Days"] = len(items)
+    report["nextUp"] = items[0] if items else None
+    json.dump(report, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="mokuzen-agenda", description=__doc__)
+    parser.add_argument("--config", help="path to mokuzen.json")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="print the next occurrence inside the lead window")
+    check.add_argument("--window", type=int, help="lead window in seconds (overrides config)")
+    check.set_defaults(func=cmd_check)
+
+    listing = sub.add_parser("list", help="print upcoming occurrences")
+    listing.add_argument("--days", type=int, default=7)
+    listing.add_argument("--limit", type=int, default=50)
+    listing.set_defaults(func=cmd_list)
+
+    refresh = sub.add_parser("refresh", help="refetch remote calendars")
+    refresh.set_defaults(func=cmd_refresh)
+
+    doctor = sub.add_parser("doctor", help="report configuration health")
+    doctor.set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

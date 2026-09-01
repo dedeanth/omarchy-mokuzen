@@ -1,0 +1,22 @@
+{
+  "calendars": [
+    "https://calendar.google.com/calendar/ical/YOUR-SECRET-ADDRESS/basic.ics",
+    "~/.local/share/calendars/personal"
+  ],
+
+  "leadSeconds": 60,
+  "pollSeconds": 30,
+  "refreshSeconds": 300,
+  "snoozeSeconds": 60,
+  "graceSeconds": 120,
+  "autoDismissSeconds": 0,
+
+  "ignoreAllDay": true,
+  "skipCancelled": true,
+  "skipDeclined": true,
+  "selfEmails": ["you@example.com"],
+  "ignoreTitles": ["^Focus time", "lunch"],
+  "onlyWithLink": false,
+
+  "enabled": true
+}

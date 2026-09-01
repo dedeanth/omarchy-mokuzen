@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dedeanth.mokuzen",
+  "name": "Mokuzen",
+  "version": "1.0.0",
+  "author": "dedeanth",
+  "license": "MIT",
+  "description": "A fullscreen alert before every meeting, so the next one is impossible to miss.",
+  "kinds": [
+    "service",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Overlay.qml"
+  }
+}
