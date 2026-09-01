@@ -132,10 +132,13 @@ Item {
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
 
+    // Fully opaque on purpose. This is the one surface that is allowed to
+    // interrupt, and a translucent one lets the desktop behind it keep
+    // competing for attention — the theme's background may also carry its own
+    // alpha, so the channels are taken and the opacity is pinned.
     Rectangle {
       anchors.fill: parent
-      color: Color.background
-      opacity: 0.97
+      color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 1.0)
     }
 
     FocusScope {
