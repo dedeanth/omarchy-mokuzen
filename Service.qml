@@ -21,6 +21,14 @@ Item {
   // wherever the user installed it.
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
   readonly property string agendaScript: pluginDir + "bin/mokuzen-agenda"
+  // Mirrors bin/mokuzen-agenda's own config_path(): honor XDG_CONFIG_HOME
+  // when set, rather than assuming ~/.config, so the panel watches the same
+  // file the script actually reads.
+  readonly property string configHome: {
+    var xdg = Quickshell.env("XDG_CONFIG_HOME")
+    return (xdg && xdg.length > 0) ? xdg : (Quickshell.env("HOME") + "/.config")
+  }
+  readonly property string configPath: configHome + "/omarchy/mokuzen.json"
 
   // ---- configuration -----------------------------------------------------
 
@@ -184,11 +192,38 @@ Item {
     return match[1] + "/…" + tail
   }
 
+  // ---- hard deadlines on every Python child -------------------------------
+  //
+  // bin/mokuzen-agenda now bounds its own memory and CPU use against a
+  // hostile calendar, but the process boundary is the last line of defense:
+  // a wedged filesystem, a hung DNS lookup outside the script's own network
+  // timeout, or a future regression must not be able to sit inside the shell
+  // process forever. main() makes the script its own process-group leader
+  // (os.setpgid(0, 0)) whenever it isn't attached to a terminal — which a
+  // Process launched from here never is — deliberately not a `setsid`
+  // wrapper, since that utility only forks when the *caller* is already a
+  // process-group leader, which depends on how this Process type itself
+  // spawns children and is not ours to assume. A watchdog Timer below kills
+  // the whole group that self-setpgid made, not just the tracked PID, if a
+  // run goes past its budget.
+
+  function killHard(proc) {
+    if (!proc.running) return
+    var pid = proc.processId
+    proc.signal(9) // SIGKILL the tracked child directly.
+    if (pid !== null && pid !== undefined) {
+      // ...and the rest of its self-made process group, in case it ever
+      // spawns a child of its own.
+      Quickshell.execDetached(["kill", "-9", "--", "-" + String(pid)])
+    }
+  }
+
   function refreshUpcoming() {
     if (!root.hasCalendars) {
       root.upcoming = []
       return
     }
+    agendaListWatchdog.restart()
     agendaList.running = true
   }
 
@@ -206,6 +241,17 @@ Item {
         }
       }
     }
+    onExited: function(exitCode) { agendaListWatchdog.stop() }
+  }
+
+  Timer {
+    id: agendaListWatchdog
+    // Python's own shared fetch deadline (FETCH_TOTAL_DEADLINE) plus one
+    // worst-case socket-read overshoot is ~23s; this stays comfortably
+    // above that regardless of how many calendars are configured.
+    interval: 30000
+    repeat: false
+    onTriggered: root.killHard(agendaList)
   }
 
   Timer {
@@ -241,6 +287,7 @@ Item {
     root.pendingConfigCommands = queued
     root.busy = true
     configProcess.command = ["python3", root.agendaScript, "setup"].concat(next)
+    configWatchdog.restart()
     configProcess.running = true
   }
 
@@ -249,12 +296,23 @@ Item {
     onExited: function(exitCode) {
       // A non-zero exit here is usually "that address does not answer", which
       // the panel surfaces; the write itself already happened.
+      configWatchdog.stop()
       root.startNextConfig()
       if (root.pendingConfigCommands.length === 0) {
         root.refreshUpcoming()
         root.check()
       }
     }
+  }
+
+  Timer {
+    id: configWatchdog
+    // Setup verifies every configured calendar over the network before
+    // returning, against its own shared SETUP_VERIFY_DEADLINE (45s) plus
+    // one worst-case socket-read overshoot — this stays above that.
+    interval: 70000
+    repeat: false
+    onTriggered: root.killHard(configProcess)
   }
 
   function addCalendar(source) {
@@ -274,21 +332,33 @@ Item {
   Process {
     id: agendaCheck
     // python3 explicitly rather than relying on the file mode surviving a
-    // clone, a zip download, or a copy across filesystems.
+    // clone, a zip download, or a copy across filesystems. The script makes
+    // itself its own process group leader on startup, so the watchdog below
+    // can kill the whole group, not just this PID.
     command: ["python3", root.agendaScript, "check"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleCheck(text)
     }
     onExited: function(exitCode) {
+      checkWatchdog.stop()
       root.checking = false
       if (exitCode !== 0) console.warn("mokuzen: agenda check exited", exitCode)
     }
   }
 
+  Timer {
+    id: checkWatchdog
+    // See agendaListWatchdog: comfortably above Python's own worst case.
+    interval: 30000
+    repeat: false
+    onTriggered: root.killHard(agendaCheck)
+  }
+
   function check() {
     if (root.checking || !root.enabled || !root.hasCalendars) return
     root.checking = true
+    checkWatchdog.restart()
     agendaCheck.running = true
   }
 
@@ -305,7 +375,7 @@ Item {
 
   FileView {
     id: configFile
-    path: Quickshell.env("HOME") + "/.config/omarchy/mokuzen.json"
+    path: root.configPath
     watchChanges: true
     printErrors: false
     onLoaded: {
@@ -319,5 +389,14 @@ Item {
     }
     onLoadFailed: root.config = ({})
     onFileChanged: reload()
+  }
+
+  // If the plugin is disabled or reloaded while a Python child is mid-run,
+  // that child must not outlive this component — Quickshell tearing down the
+  // Service is not the same as the process tree ending on its own.
+  Component.onDestruction: {
+    killHard(agendaList)
+    killHard(configProcess)
+    killHard(agendaCheck)
   }
 }

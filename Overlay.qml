@@ -185,6 +185,9 @@ Item {
           Layout.alignment: Qt.AlignHCenter
           Layout.fillWidth: true
           text: root.summary
+          // The event title comes straight from a calendar we do not
+          // control; AutoText would let it be interpreted as rich text.
+          textFormat: Text.PlainText
           color: Color.foreground
           font.family: Style.font.family
           font.pixelSize: root.titleSize
@@ -202,6 +205,8 @@ Item {
             var span = root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
             return root.calendarName ? span + "  ·  " + root.calendarName : span
           }
+          // calendarName is the calendar's own X-WR-CALNAME, also untrusted.
+          textFormat: Text.PlainText
           color: Color.muted
           font.family: Style.font.family
           font.pixelSize: root.detailSize
@@ -212,6 +217,9 @@ Item {
           Layout.fillWidth: true
           visible: text !== ""
           text: root.link ? root.linkLabel() : root.location
+          // Both the link host and the free-text location are calendar-
+          // controlled.
+          textFormat: Text.PlainText
           color: Color.muted
           font.family: Style.font.family
           font.pixelSize: Style.font.subtitle
@@ -284,6 +292,9 @@ Item {
           Layout.topMargin: Style.space(8)
           visible: !!root.service && root.service.lastWarning !== ""
           text: root.service ? root.service.lastWarning : ""
+          // Warnings can echo a fetch error, which can echo calendar-server
+          // content; never let it be interpreted as rich text.
+          textFormat: Text.PlainText
           color: Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption

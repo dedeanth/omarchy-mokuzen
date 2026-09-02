@@ -91,6 +91,9 @@ BarWidget {
     Text {
       visible: text !== "" && !root.vertical
       text: root.barLabel()
+      // In "title" mode this is the event summary from a calendar we do not
+      // control.
+      textFormat: Text.PlainText
       color: root.imminent ? Color.urgent : root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -226,6 +229,8 @@ BarWidget {
             Text {
               Layout.fillWidth: true
               text: modelData.summary
+              // Event summary, straight from the calendar.
+              textFormat: Text.PlainText
               color: Color.popups.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -272,6 +277,9 @@ BarWidget {
             Text {
               Layout.fillWidth: true
               text: root.service ? root.service.maskCalendar(modelData) : ""
+              // A masked calendar address is still address-shaped text from
+              // outside this plugin's control.
+              textFormat: Text.PlainText
               color: Color.popups.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -447,6 +455,9 @@ BarWidget {
             if (root.service && root.service.lastWarning !== "") return root.service.lastWarning
             return ""
           }
+          // lastWarning can carry a fetch error, which can carry text from a
+          // calendar server.
+          textFormat: Text.PlainText
           color: root.service && root.service.busy ? Color.muted : Color.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
