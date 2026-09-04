@@ -125,6 +125,13 @@ MAX_SELF_EMAILS = 64
 MAX_EMAIL_CHARS = 320
 MAX_REGEX_INPUT_CHARS = 2_000
 MAX_REGEX_SECONDS = 0.02
+MAX_CURRENT_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
+MAX_ICS_DIR_DEPTH = 64
+
+
+def _bounded_warnings(warnings) -> list[str]:
+    """Bound every diagnostic before it can enter the QML model or cache."""
+    return [str(item)[:MAX_WARNING_CHARS] for item in warnings[:MAX_WARNINGS]]
 
 
 # --------------------------------------------------------------------------
@@ -316,66 +323,150 @@ def write_private(path: Path, text: str) -> None:
         os.close(dir_fd)
 
 
-def _read_capped_no_follow(path: Path, max_bytes: int) -> str:
-    """Read a regular file through a byte cap without following its leaf."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(path), flags)
+def _read_capped_fd(fd: int, max_bytes: int, label: str) -> str:
+    """Consume an already-open regular-file descriptor through a byte cap."""
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"{path} is not a regular file")
+            raise OSError(f"{label} is not a regular file")
         if st.st_size > max_bytes:
-            raise OSError(f"{path} exceeds {max_bytes} bytes, refusing to read")
+            raise OSError(f"{label} exceeds {max_bytes} bytes, refusing to read")
     except BaseException:
         os.close(fd)
         raise
     with os.fdopen(fd, "rb") as handle:
-        data = handle.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise OSError(f"{path} exceeds {max_bytes} bytes, refusing to read")
-    return data.decode("utf-8", errors="replace")
+        payload = handle.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise OSError(f"{label} exceeds {max_bytes} bytes, refusing to read")
+    return payload.decode("utf-8", errors="replace")
 
 
-def _iter_ics_files(root: Path, limit: int) -> list[Path]:
-    """Enumerate .ics files under root without following symlinks — so a
-    configured directory cannot be pointed outside itself or looped back on
-    itself — and capped so a directory bomb cannot make this run forever.
-    Each directory level is read through a bounded iterator, so a single
-    directory with millions of entries cannot be fully materialized before
-    the cap has a chance to apply. The stack itself is also capped: finding
-    at most MAX_ICS_FILES_PER_SOURCE .ics files does not by itself bound how
-    many *empty* subdirectories get visited on the way, so that is bounded
-    separately here."""
-    found: list[Path] = []
-    stack = [root]
+def _read_capped_no_follow(path: Path, max_bytes: int) -> str:
+    """Read a regular file through a byte cap without following its leaf."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    return _read_capped_fd(fd, max_bytes, str(path))
+
+
+def _read_capped_at(dir_fd: int, name: str, max_bytes: int, label: str) -> str:
+    """Read one directory entry without reopening a raceable path."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=dir_fd)
+    return _read_capped_fd(fd, max_bytes, label)
+
+
+def _read_ics_directory(root: Path, limit: int) -> tuple[list[str], list[str]]:
+    """Read a bounded directory tree entirely through directory FDs.
+
+    Every child is opened relative to the descriptor that was enumerated,
+    with O_NOFOLLOW and a post-open type check. A rename or symlink swap
+    between enumeration and open therefore fails closed instead of escaping
+    the configured tree. Depth, visited directories, entries, files and bytes
+    all have independent ceilings.
+    """
+    documents: list[str] = []
+    warnings: list[str] = []
     visited_dirs = 0
-    while stack and len(found) < limit and visited_dirs < MAX_DIRS_VISITED:
-        current = stack.pop()
+    files_seen = 0
+    total_bytes = 0
+    warned_dir_limit = False
+
+    def warn(message: str) -> None:
+        if len(warnings) < MAX_WARNINGS:
+            warnings.append(str(message)[:MAX_WARNING_CHARS])
+
+    def visit(dir_fd: int, label: Path, depth: int) -> None:
+        nonlocal visited_dirs, files_seen, total_bytes, warned_dir_limit
+        if visited_dirs >= MAX_DIRS_VISITED:
+            if not warned_dir_limit:
+                warn(f"{root}: reached the {MAX_DIRS_VISITED}-directory limit")
+                warned_dir_limit = True
+            return
         visited_dirs += 1
-        entries = []
+
+        entries: list[tuple[str, bool, bool, bool]] = []
+        truncated_level = False
         try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    entries.append(entry)
+            with os.scandir(dir_fd) as iterator:
+                for entry in iterator:
                     if len(entries) >= MAX_DIR_ENTRIES_PER_LEVEL:
+                        truncated_level = True
                         break
-        except OSError:
-            continue
-        entries.sort(key=lambda e: e.name)
-        for entry in entries:
-            if entry.is_symlink():
+                    try:
+                        entries.append((
+                            entry.name,
+                            entry.is_symlink(),
+                            entry.is_dir(follow_symlinks=False),
+                            entry.is_file(follow_symlinks=False),
+                        ))
+                    except OSError:
+                        continue
+        except OSError as exc:
+            warn(f"{label}: {exc}")
+            return
+        if truncated_level:
+            warn(f"{label}: reached the {MAX_DIR_ENTRIES_PER_LEVEL}-entry limit")
+
+        for name, is_symlink, is_directory, is_file in sorted(
+            entries, key=lambda row: row[0]
+        ):
+            if files_seen >= limit:
+                return
+            child_label = label / name
+            if is_symlink:
                 continue
-            if entry.is_dir(follow_symlinks=False):
-                # Bound pending work, not just directories already visited —
-                # otherwise one level with thousands of subdirectories could
-                # queue far more than MAX_DIRS_VISITED will ever get to pop.
-                if len(stack) < MAX_DIRS_VISITED:
-                    stack.append(Path(entry.path))
-            elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".ics"):
-                found.append(Path(entry.path))
-                if len(found) >= limit:
-                    break
-    return sorted(found)[:limit]
+            if is_file and name.endswith(".ics"):
+                files_seen += 1
+                remaining = MAX_ICS_DIR_TOTAL_BYTES - total_bytes
+                if remaining <= 0:
+                    warn(f"{root}: reached the {MAX_ICS_DIR_TOTAL_BYTES}-byte budget")
+                    return
+                try:
+                    text = _read_capped_at(
+                        dir_fd, name, min(MAX_ICS_FILE_BYTES, remaining), str(child_label)
+                    )
+                except OSError as exc:
+                    warn(str(exc))
+                    continue
+                total_bytes += len(text.encode("utf-8"))
+                documents.append(text)
+                continue
+            if not is_directory:
+                continue
+            if depth >= MAX_ICS_DIR_DEPTH:
+                warn(f"{child_label}: reached the {MAX_ICS_DIR_DEPTH}-level depth limit")
+                continue
+            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            child_fd = -1
+            try:
+                child_fd = os.open(name, flags, dir_fd=dir_fd)
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                    raise OSError(f"{child_label} is not a directory")
+            except OSError as exc:
+                if child_fd >= 0:
+                    os.close(child_fd)
+                warn(f"{child_label}: {exc}")
+                continue
+            try:
+                visit(child_fd, child_label, depth + 1)
+            finally:
+                os.close(child_fd)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = -1
+    try:
+        root_fd = os.open(str(root), flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise OSError(f"{root} is not a directory")
+    except OSError as exc:
+        if root_fd >= 0:
+            os.close(root_fd)
+        return [], [str(exc)[:MAX_WARNING_CHARS]]
+    try:
+        visit(root_fd, root, 0)
+    finally:
+        os.close(root_fd)
+    return documents, warnings
 
 
 # --------------------------------------------------------------------------
@@ -449,10 +540,10 @@ def _public_addresses(hostname: str | None, port: int) -> list[str] | None:
             addr = ipaddress.ip_address(raw)
         except ValueError:
             return []
-        if (
-            addr.is_private or addr.is_loopback or addr.is_link_local
-            or addr.is_multicast or addr.is_reserved or addr.is_unspecified
-        ):
+        # is_global also rejects shared carrier space (100.64/10),
+        # documentation ranges and deprecated IPv6 site-local addresses that
+        # are neither is_private nor safely Internet-routable.
+        if not addr.is_global:
             return []
         if raw not in addresses:
             addresses.append(raw)
@@ -725,23 +816,7 @@ def read_source(
     if path.is_symlink():
         return [], [f"{path}: symlinked calendar sources are not followed"]
     if path.is_dir():
-        documents, warnings = [], []
-        total_bytes = 0
-        for child in _iter_ics_files(path, MAX_ICS_FILES_PER_SOURCE):
-            if total_bytes >= MAX_ICS_DIR_TOTAL_BYTES:
-                warnings.append(
-                    f"{path}: reached the {MAX_ICS_DIR_TOTAL_BYTES}-byte budget for this "
-                    "directory, remaining files were skipped"
-                )
-                break
-            try:
-                text = _read_capped_no_follow(child, MAX_ICS_FILE_BYTES)
-            except OSError as exc:
-                warnings.append(f"{child}: {exc}")
-                continue
-            total_bytes += len(text.encode("utf-8"))
-            documents.append(text)
-        return documents, warnings
+        return _read_ics_directory(path, MAX_ICS_FILES_PER_SOURCE)
     if path.is_file():
         try:
             return [_read_capped_no_follow(path, MAX_ICS_FILE_BYTES)], []
@@ -1383,12 +1458,12 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                 warnings.append(
                     f"stopped after {MAX_TOTAL_DOCUMENTS} calendar documents; the rest were ignored"
                 )
-                return events, warnings[:MAX_WARNINGS]
+                return events, _bounded_warnings(warnings)
             if total_bytes + document_bytes > MAX_TOTAL_ICS_BYTES:
                 warnings.append(
                     f"stopped after the {MAX_TOTAL_ICS_BYTES}-byte aggregate calendar budget"
                 )
-                return events, warnings[:MAX_WARNINGS]
+                return events, _bounded_warnings(warnings)
             total_documents += 1
             total_bytes += document_bytes
             parsed_events, truncated = split_events(document)
@@ -1402,7 +1477,7 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                     warnings.append(
                         f"stopped after {MAX_TOTAL_EVENTS} total events; the rest were ignored"
                     )
-                    return events, warnings[:MAX_WARNINGS]
+                    return events, _bounded_warnings(warnings)
                 try:
                     event = parse_event(lines, label)
                 except Exception:
@@ -1414,7 +1489,7 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                     overrides[key] = event
                 events.append(event)
 
-    return events, warnings[:MAX_WARNINGS]
+    return events, _bounded_warnings(warnings)
 
 
 class _RegexTimedOut(Exception):
@@ -1496,14 +1571,22 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
             break
         if not wanted(event, cfg):
             continue
-        length = (
-            event["end"] - event["start"]
-            if not event["all_day"]
-            else timedelta(days=1)
-        )
+        try:
+            length = (
+                event["end"] - event["start"]
+                if not event["all_day"]
+                else timedelta(days=1)
+            )
+        except (OverflowError, TypeError):
+            continue
+        if length <= timedelta(0):
+            continue
         # The alert path only needs a short grace period, but the bar also
-        # needs occurrences that started earlier and have not ended yet.
-        event_window_start = min(window_start, now - max(length, timedelta(minutes=5)))
+        # needs occurrences that started earlier and have not ended yet. Keep
+        # that lookback bounded even if a hostile event claims a duration of
+        # centuries; ordinary meetings and multi-day events remain covered.
+        lookback = min(length, timedelta(seconds=MAX_CURRENT_LOOKBACK_SECONDS))
+        event_window_start = min(window_start, now - lookback)
         try:
             event_starts = expand(event, event_window_start, window_end)
         except Exception:
@@ -1516,7 +1599,7 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
                     f"stopped after {MAX_OCCURRENCES} occurrences; the rest were ignored"
                 )
                 out.sort(key=lambda item: item["start"])
-                return out, warnings[:MAX_WARNINGS]
+                return out, _bounded_warnings(warnings)
             if event["recurrence_id"] is None and (event["uid"], str(start)) in overridden:
                 continue
             link = find_link(event)
@@ -1542,7 +1625,7 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
                     f"stopped after the {MAX_OCCURRENCE_PAYLOAD_BYTES}-byte occurrence budget"
                 )
                 out.sort(key=lambda entry: entry["start"])
-                return out, warnings[:MAX_WARNINGS]
+                return out, _bounded_warnings(warnings)
             out.append(item)
             out_bytes += item_bytes
 
@@ -1553,7 +1636,7 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
         )
 
     out.sort(key=lambda item: item["start"])
-    return out, warnings[:MAX_WARNINGS]
+    return out, _bounded_warnings(warnings)
 
 
 # --------------------------------------------------------------------------

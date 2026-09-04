@@ -99,6 +99,12 @@ class BoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AGENDA._validate_config(cfg, Path("mokuzen.json"))
 
+    def test_warnings_are_bounded_before_reaching_qml(self):
+        warnings = ["x" * (AGENDA.MAX_WARNING_CHARS + 1)] * (AGENDA.MAX_WARNINGS + 1)
+        bounded = AGENDA._bounded_warnings(warnings)
+        self.assertEqual(len(bounded), AGENDA.MAX_WARNINGS)
+        self.assertTrue(all(len(item) == AGENDA.MAX_WARNING_CHARS for item in bounded))
+
     def test_plain_http_calendar_is_rejected_by_configuration(self):
         cfg = dict(AGENDA.DEFAULTS)
         cfg["calendars"] = ["http://calendar.example/secret.ics"]
@@ -141,9 +147,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("very-secret-token", masked)
         self.assertNotIn("password", masked)
 
-    def test_private_network_destinations_are_rejected(self):
+    def test_non_global_network_destinations_are_rejected(self):
         self.assertEqual(AGENDA._public_addresses("127.0.0.1", 443), [])
         self.assertEqual(AGENDA._public_addresses("169.254.169.254", 443), [])
+        self.assertEqual(AGENDA._public_addresses("100.64.0.1", 443), [])
 
     def test_redirects_cannot_downgrade_or_target_private_networks(self):
         handler = AGENDA._HttpsOnlyRedirectHandler()
@@ -156,6 +163,18 @@ class BoundaryTests(unittest.TestCase):
                 AGENDA.urllib.error.URLError
             ):
                 handler.redirect_request(None, None, 302, "Found", {}, destination)
+
+    def test_response_body_is_streamed_through_a_hard_byte_cap(self):
+        class Response:
+            def __init__(self):
+                self.chunks = iter((b"ab", b"cd", b""))
+
+            def read(self, size):
+                self.asserted_size = size
+                return next(self.chunks)
+
+        with self.assertRaises(AGENDA._FetchTooLarge):
+            AGENDA._read_capped_response(Response(), 3, time.monotonic() + 1)
 
     def test_fetch_deadline_kills_worker(self):
         worker = mock.Mock()
@@ -224,6 +243,72 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["startsIn"], -3600)
+
+    def test_extreme_event_duration_cannot_underflow_the_current_lookback(self):
+        now = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
+        event = {
+            "uid": "extreme-duration",
+            "summary": "",
+            "location": "",
+            "description": "",
+            "url": "",
+            "conference": "",
+            "calendar": "test",
+            "status": "",
+            "rrule": "",
+            "exdates": [],
+            "recurrence_id": None,
+            "all_day": False,
+            "start": datetime.min.replace(tzinfo=timezone.utc),
+            "end": datetime.max.replace(tzinfo=timezone.utc),
+        }
+        with mock.patch.object(AGENDA, "collect", return_value=([event], [])):
+            items, warnings = AGENDA.occurrences(
+                dict(AGENDA.DEFAULTS), now, timedelta(days=1)
+            )
+        self.assertEqual(items, [])
+        self.assertEqual(warnings, [])
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
+    def test_directory_reader_does_not_follow_nested_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "inside.ics").write_text("inside", encoding="utf-8")
+            (outside / "secret.ics").write_text("outside", encoding="utf-8")
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+            documents, warnings = AGENDA._read_ics_directory(root, 10)
+        self.assertEqual(documents, ["inside"])
+        self.assertEqual(warnings, [])
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
+    def test_private_write_replaces_a_leaf_symlink_without_touching_its_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_text("original", encoding="utf-8")
+            link = root / "value"
+            link.symlink_to(target)
+            AGENDA.write_private(link, "replacement")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(link.read_text(encoding="utf-8"), "replacement")
+            self.assertEqual(link.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
+    def test_private_write_refuses_a_symlinked_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            link = root / "linked-parent"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(SystemExit):
+                AGENDA.write_private(link / "value", "replacement")
+            self.assertFalse((target / "value").exists())
 
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
     def test_capped_read_does_not_follow_leaf_symlink(self):

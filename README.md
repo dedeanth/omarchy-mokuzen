@@ -127,7 +127,9 @@ you were typing when it appeared can't act on it by accident.
 ## In the bar
 
 A calendar glyph and how long you have — `8h57`, `42m`, `<1m` — turning urgent
-as the alert approaches. Left click opens the panel, middle click refetches.
+as the alert approaches. While a meeting is under way, the bar switches to
+`En cours` with its remaining time; the panel shows its title separately above
+the genuine future events in **Next up**. Left click opens the panel, middle click refetches.
 It also answers on the `mokuzen` IPC target, if you'd rather bind a key:
 
 ```bash
