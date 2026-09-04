@@ -341,6 +341,7 @@ BarWidget {
             id: addressField
             visible: root.editingCalendar
             Layout.fillWidth: true
+            maximumLength: 4096
             placeholderText: "paste the address, then Enter"
             Keys.onEscapePressed: root.cancelEditingCalendar()
             color: Color.popups.text

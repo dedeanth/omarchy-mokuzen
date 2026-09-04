@@ -21,8 +21,8 @@ out of the way.
 - **Nothing to install.** The whole calendar stack — iCalendar parsing,
   recurrences, exceptions, time zones, meeting links — is Python standard
   library.
-- **No background process of its own.** It runs inside the Omarchy shell
-  that's already there, and costs about a sixth of a second every half minute.
+- **No background daemon of its own.** The Omarchy shell launches short-lived
+  helper jobs only when needed, each with a hard deadline and bounded output.
 - **One key to join.** Meet, Zoom, Teams, Webex, Whereby, Jitsi, Around,
   Gather, Slack huddles — found in the location, the description, the `URL`,
   or Google's conference field.
@@ -74,13 +74,14 @@ python3 bin/mokuzen-agenda setup --remove-calendar "https://…"
 ```
 
 **By hand**, if you prefer — the file is plain JSON, and the shell picks up
-saved changes with no restart.
+saved changes within 15 seconds, with no restart.
 
-`calendars` takes as many sources as you like, mixed freely — work in one,
-personal in another. A folder counts as one source: every `.ics` under it is
-read. Remote ones are refetched every `refreshSeconds` and cached; when the
-network is down the cached copy is used, and Mokuzen says so rather than
-pretending your day is empty.
+`calendars` takes up to 32 sources, mixed freely — work in one, personal in
+another. A folder counts as one source: a bounded number of regular `.ics`
+files under it is read; symbolic links are not followed. Remote ones are
+refetched every `refreshSeconds` and cached; when the network is down the
+cached copy is used, and Mokuzen says so rather than pretending your day is
+empty.
 
 <details>
 <summary><b>Every setting</b></summary>
@@ -190,8 +191,14 @@ established on macOS. Mokuzen is that idea for Omarchy.
 
 ## Requirements
 
-Omarchy 4 with its Quickshell shell · Python 3.9+ (standard library only) ·
+Omarchy 4 with its Quickshell shell · Python 3.10+ (standard library only) ·
 `xdg-open`
+
+Security and recurrence regressions can be checked with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 

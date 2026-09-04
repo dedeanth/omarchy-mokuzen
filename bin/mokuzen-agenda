@@ -18,12 +18,15 @@ from __future__ import annotations
 import argparse
 import calendar as _calendar
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import stat
+import subprocess
 import sys
 import time
 import urllib.error
@@ -39,16 +42,8 @@ except ImportError:  # pragma: no cover - Python < 3.9
 
 USER_AGENT = "mokuzen/1.0 (+https://github.com/dedeanth/omarchy-mokuzen)"
 NETWORK_TIMEOUT = 8
-# This process exists for one short-lived command invocation, never as a
-# long-running daemon, so a single process-wide socket timeout is simpler
-# than threading one through every call, and it is what urllib's own
-# per-request `timeout=` argument is built on. Note it does NOT bound
-# getaddrinfo() — DNS resolution is a blocking libc call the stdlib gives no
-# way to time out — so a hung resolver is still caught only by
-# FETCH_TOTAL_DEADLINE and, as the last resort, the QML watchdog.
-socket.setdefaulttimeout(NETWORK_TIMEOUT)
 # Shared across every remote calendar fetched within one command invocation
-# (see collect()), not per-URL — five slow calendars must not add up to five
+# (see collect()), not per-URL - five slow calendars must not add up to five
 # times this budget, since the QML side kills the whole process on a single
 # fixed deadline regardless of how many calendars are configured.
 FETCH_TOTAL_DEADLINE = 15
@@ -62,12 +57,16 @@ DEFAULTS = {
     "pollSeconds": 30,
     "refreshSeconds": 300,
     "lookaheadDays": 30,
+    "snoozeSeconds": 60,
+    "graceSeconds": 120,
+    "autoDismissSeconds": 0,
     "ignoreAllDay": True,
     "skipCancelled": True,
     "skipDeclined": True,
     "selfEmails": [],
     "ignoreTitles": [],
     "onlyWithLink": False,
+    "enabled": True,
 }
 
 # Every cap below exists because a calendar is not trusted input: it can be a
@@ -88,6 +87,7 @@ MAX_LINES_PER_EVENT = 2_000
 # guess a real calendar, so it sits well above that.
 MAX_EVENTS_PER_DOCUMENT = 20_000
 MAX_FIELD_CHARS = 2_000
+MAX_UID_CHARS = 512
 MAX_DESCRIPTION_CHARS = 20_000
 MAX_EXDATES_PER_EVENT = 500
 MAX_RULE_TOKENS = 366
@@ -110,6 +110,21 @@ MAX_ICS_DIR_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_DIR_ENTRIES_PER_LEVEL = 5_000
 MAX_DIRS_VISITED = 20_000
 MAX_WARNINGS = 50
+MAX_CALENDAR_SOURCES = 32
+MAX_SOURCE_CHARS = 4_096
+MAX_TOTAL_DOCUMENTS = 256
+MAX_TOTAL_ICS_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_EVENTS = 50_000
+MAX_OCCURRENCES = 5_000
+MAX_OCCURRENCE_PAYLOAD_BYTES = 8 * 1024 * 1024
+MAX_LINK_CHARS = 2_000
+MAX_WARNING_CHARS = 5_000
+MAX_IGNORE_TITLES = 32
+MAX_IGNORE_PATTERN_CHARS = 256
+MAX_SELF_EMAILS = 64
+MAX_EMAIL_CHARS = 320
+MAX_REGEX_INPUT_CHARS = 2_000
+MAX_REGEX_SECONDS = 0.02
 
 
 # --------------------------------------------------------------------------
@@ -123,22 +138,94 @@ def config_path(explicit: str | None) -> Path:
     return Path(base) / "omarchy" / "mokuzen.json"
 
 
+def _bounded_string_list(value, name: str, count: int, chars: int) -> list[str]:
+    if isinstance(value, str) and name == "calendars":
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a JSON array")
+    if len(value) > count:
+        raise ValueError(f"{name} contains more than {count} entries")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"every {name} entry must be a string")
+        if not item or len(item) > chars:
+            raise ValueError(f"every {name} entry must contain 1..{chars} characters")
+        result.append(item)
+    return result
+
+
+def _validate_config(loaded: dict, path: Path) -> dict:
+    cfg = dict(DEFAULTS)
+    cfg.update(loaded)
+
+    cfg["calendars"] = _bounded_string_list(
+        cfg.get("calendars", []), "calendars", MAX_CALENDAR_SOURCES, MAX_SOURCE_CHARS
+    )
+    for source in cfg["calendars"]:
+        lower = source.lower()
+        if lower.startswith("http://"):
+            raise ValueError("remote calendar URLs must use https:// or webcal://")
+        if lower.startswith(("https://", "webcal://")):
+            parsed = urlsplit(normalize_url(source))
+            try:
+                parsed_port = parsed.port
+            except ValueError:
+                raise ValueError("remote calendar URL has an invalid port")
+            if (
+                not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed_port is not None and not 1 <= parsed_port <= 65_535
+            ):
+                raise ValueError("remote calendar URL is malformed or contains user-info")
+    cfg["ignoreTitles"] = _bounded_string_list(
+        cfg.get("ignoreTitles", []), "ignoreTitles", MAX_IGNORE_TITLES,
+        MAX_IGNORE_PATTERN_CHARS,
+    )
+    cfg["selfEmails"] = _bounded_string_list(
+        cfg.get("selfEmails", []), "selfEmails", MAX_SELF_EMAILS, MAX_EMAIL_CHARS
+    )
+
+    for key in ("ignoreAllDay", "skipCancelled", "skipDeclined", "onlyWithLink", "enabled"):
+        if not isinstance(cfg.get(key), bool):
+            raise ValueError(f"{key} must be true or false")
+
+    ranges = {
+        "leadSeconds": (0, 86_400),
+        "pollSeconds": (10, 86_400),
+        "refreshSeconds": (30, 86_400),
+        "lookaheadDays": (1, 366),
+        "snoozeSeconds": (30, 604_800),
+        "graceSeconds": (0, 86_400),
+        "autoDismissSeconds": (0, 86_400),
+    }
+    for key, (minimum, maximum) in ranges.items():
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an integer")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+
+    cfg["_path"] = str(path)
+    cfg["_exists"] = path.exists()
+    return cfg
+
+
 def load_config(explicit: str | None) -> dict:
     path = config_path(explicit)
-    cfg = dict(DEFAULTS)
+    loaded: dict = {}
     if path.exists():
         try:
-            loaded = json.loads(_read_capped(path, MAX_CONFIG_BYTES))
+            loaded = json.loads(_read_capped_no_follow(path, MAX_CONFIG_BYTES))
         except (OSError, ValueError) as exc:
             raise SystemExit(f"mokuzen: cannot read {path}: {exc}")
         if not isinstance(loaded, dict):
             raise SystemExit(f"mokuzen: {path} must contain a JSON object")
-        cfg.update(loaded)
-    cfg["_path"] = str(path)
-    cfg["_exists"] = path.exists()
-    if isinstance(cfg.get("calendars"), str):
-        cfg["calendars"] = [cfg["calendars"]]
-    return cfg
+    try:
+        return _validate_config(loaded, path)
+    except ValueError as exc:
+        raise SystemExit(f"mokuzen: invalid configuration in {path}: {exc}")
 
 
 def cache_dir() -> Path:
@@ -175,11 +262,11 @@ def cache_dir() -> Path:
 def _owner_dir_fd(path: Path) -> int:
     """Open path as a directory descriptor, refusing a symlinked leaf (via
     O_NOFOLLOW — open fails with ELOOP before we ever see it) or one owned by
-    someone else. Only a directory this call creates itself gets its mode
-    tightened: an existing one — mokuzen.json's parent is the rest of the
-    user's omarchy configuration, not ours — is used as found."""
+    someone else. Existing directories are never chmodded here:
+    mokuzen.json's parent is the rest of the user's Omarchy configuration,
+    not ours. cache_dir(), which owns its directory, tightens that mode
+    explicitly after this check."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    created = False
     try:
         fd = os.open(str(path), flags)
     except FileNotFoundError:
@@ -188,18 +275,12 @@ def _owner_dir_fd(path: Path) -> int:
             fd = os.open(str(path), flags)
         except OSError as exc:
             raise SystemExit(f"mokuzen: refusing to use {path}: {exc}")
-        created = True
     except OSError as exc:
         raise SystemExit(f"mokuzen: refusing to use {path}: {exc}")
     try:
         st = os.fstat(fd)
         if st.st_uid != os.getuid():
             raise SystemExit(f"mokuzen: refusing to use {path}: not an owner-only directory")
-        if created:
-            try:
-                os.fchmod(fd, 0o700)
-            except OSError:
-                pass
     except BaseException:
         os.close(fd)
         raise
@@ -235,29 +316,8 @@ def write_private(path: Path, text: str) -> None:
         os.close(dir_fd)
 
 
-def _read_capped(path: Path, max_bytes: int) -> str:
-    """Read a file up to max_bytes. Follows symlinks on purpose: this is for
-    paths the user pointed us at directly (the config file, a calendar file
-    or directory) where atomic symlink-swap by an external sync tool is a
-    legitimate, expected update mechanism, not an attack."""
-    st = path.stat()
-    if not stat.S_ISREG(st.st_mode):
-        raise OSError(f"{path} is not a regular file")
-    if st.st_size > max_bytes:
-        raise OSError(f"{path} exceeds {max_bytes} bytes, refusing to read")
-    with open(path, "rb") as handle:
-        data = handle.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise OSError(f"{path} exceeds {max_bytes} bytes, refusing to read")
-    return data.decode("utf-8", errors="replace")
-
-
 def _read_capped_no_follow(path: Path, max_bytes: int) -> str:
-    """Like _read_capped, but refuses a symlinked leaf: for state this
-    process owns outright (its own cache files) and for entries discovered
-    while walking a calendar directory, where the leaf name was not chosen
-    by the user and following it would mean trusting whatever the directory
-    contents point at."""
+    """Read a regular file through a byte cap without following its leaf."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags)
     try:
@@ -327,20 +387,28 @@ def mask(source: str) -> str:
     calendar. Never echo one back in full."""
     if not is_remote(source):
         return source
-    match = re.match(r"^(https?://[^/]+/)(.*)$", normalize_url(source))
-    if not match:
+    parsed = urlsplit(normalize_url(source))
+    if not parsed.hostname:
         return "<remote calendar>"
-    host, rest = match.groups()
-    tail = rest[-12:] if len(rest) > 12 else rest
-    return f"{host}…{tail}"
+    # Even a short path suffix can be useful credential material. The host is
+    # enough to identify the provider without leaking any secret URL token.
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+    except ValueError:
+        return "<remote calendar>"
+    return f"https://{host}/<redacted>"
 
 
 def is_remote(source: str) -> bool:
-    return source.startswith(("http://", "https://", "webcal://"))
+    return source.lower().startswith(("http://", "https://", "webcal://"))
 
 
 def normalize_url(source: str) -> str:
-    if source.startswith("webcal://"):
+    if source.lower().startswith("webcal://"):
         return "https://" + source[len("webcal://"):]
     return source
 
@@ -358,35 +426,100 @@ class _FetchTimedOut(Exception):
     pass
 
 
-def _is_public_host(hostname: str | None) -> bool | None:
-    """A calendar host is not trusted infrastructure: a compromised or
-    hostile feed redirecting us to a link-local metadata endpoint or a LAN
-    address should not be followed just because it happens to be https.
+def _public_addresses(hostname: str | None, port: int) -> list[str] | None:
+    """Resolve once and return only addresses safe to connect to.
 
-    Returns True (public), False (resolves to a private/internal address),
-    or None (could not resolve at all — a DNS outage, not a private host,
-    so callers should say so rather than blaming the network on a policy
-    refusal)."""
+    None means DNS failed. An empty list means the host resolved, but at
+    least one answer was non-public; mixed public/private answers are rejected
+    too. The returned addresses are passed directly to the socket connection,
+    so validation and use cannot be separated by a DNS-rebinding race.
+    """
     if not hostname:
         return None
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except OSError:
         return None
     if not infos:
         return None
+    addresses: list[str] = []
     for info in infos:
         raw = info[4][0].split("%")[0]
         try:
             addr = ipaddress.ip_address(raw)
         except ValueError:
-            return False
+            return []
         if (
             addr.is_private or addr.is_loopback or addr.is_link_local
             or addr.is_multicast or addr.is_reserved or addr.is_unspecified
         ):
-            return False
-    return True
+            return []
+        if raw not in addresses:
+            addresses.append(raw)
+    return addresses
+
+
+def _is_public_host(hostname: str | None) -> bool | None:
+    """Compatibility helper used by diagnostics and tests."""
+    addresses = _public_addresses(hostname, 443)
+    return None if addresses is None else bool(addresses)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection whose socket uses addresses already policy-checked.
+
+    The HTTP Host header and TLS SNI still use the original hostname, while
+    the TCP socket connects to a validated numeric address. This closes the
+    validate-one-DNS-answer/connect-to-another rebinding window.
+    """
+
+    def __init__(self, host, *, pinned_addresses: list[str], **kwargs):
+        self._pinned_addresses = pinned_addresses
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        last_error: OSError | None = None
+        for address in self._pinned_addresses:
+            sock = None
+            try:
+                sock = socket.create_connection(
+                    (address, self.port), self.timeout, self.source_address
+                )
+                if self._tunnel_host:
+                    self.sock = sock
+                    self._tunnel()
+                server_hostname = self._tunnel_host or self.host
+                self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
+                return
+            except OSError as exc:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self.sock = None
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("calendar host has no usable public address")
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        parsed = urlsplit(req.full_url)
+        if parsed.username is not None or parsed.password is not None:
+            raise urllib.error.URLError("calendar URL user-info is not supported")
+        port = parsed.port or 443
+        addresses = _public_addresses(parsed.hostname, port)
+        if addresses is None:
+            raise urllib.error.URLError("could not resolve calendar host")
+        if not addresses:
+            raise urllib.error.URLError("calendar host resolves to a private/internal address")
+
+        def connection(host, **kwargs):
+            return _PinnedHTTPSConnection(host, pinned_addresses=addresses, **kwargs)
+
+        return self.do_open(connection, req, context=self._context)
 
 
 class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -394,17 +527,22 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
     trusted infrastructure: neither the first hop nor any redirect it sends
     us on may downgrade to plain http, or point at a private/internal host.
 
-    The connection phase (DNS + connect + TLS + headers) happens inside
-    urllib's own opener.open(), before this module's byte-cap/deadline logic
-    ever sees a response — so it is bounded here instead, by keeping the
-    hop count small. Real calendar redirects are 0-1 hops in practice."""
+    Every destination is checked here and again by the pinned HTTPS handler
+    that actually connects. The parent process imposes the wall-clock limit
+    over the whole worker, including DNS and all redirects; the small hop cap
+    is an additional bound. Real calendar redirects are 0-1 hops in practice.
+    """
 
     max_redirections = 3
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.lower().startswith("https://"):
-            raise urllib.error.URLError(f"refused redirect to non-https URL: {newurl}")
-        if _is_public_host(urlsplit(newurl).hostname) is not True:
+            raise urllib.error.URLError("refused redirect to a non-https URL")
+        parsed = urlsplit(newurl)
+        if parsed.username is not None or parsed.password is not None:
+            raise urllib.error.URLError("refused redirect containing URL user-info")
+        addresses = _public_addresses(parsed.hostname, parsed.port or 443)
+        if not addresses:
             raise urllib.error.URLError("refused redirect: private/internal host, or DNS failure")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -423,6 +561,98 @@ def _read_capped_response(response, max_bytes: int, deadline: float) -> bytes:
             raise _FetchTooLarge(f"calendar exceeds {max_bytes} bytes")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _network_fetch(url: str, budget_seconds: float) -> bytes:
+    """Perform one complete network fetch inside the disposable worker."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("calendar URL must be an HTTPS URL without user-info")
+    deadline = time.monotonic() + max(0.001, budget_seconds)
+    # Environment proxies would resolve/connect on our behalf, defeating the
+    # pinned-address SSRF check. Calendar fetches therefore connect directly.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _HttpsOnlyRedirectHandler(),
+        _PinnedHTTPSHandler(),
+    )
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with opener.open(request, timeout=NETWORK_TIMEOUT) as response:
+        if not response.geturl().lower().startswith("https://"):
+            raise urllib.error.URLError("final URL is not https://")
+        return _read_capped_response(response, MAX_REMOTE_BYTES, deadline)
+
+
+def _fetch_worker_main(argv: list[str]) -> int:
+    """Private subprocess entry point. The URL arrives on stdin so a secret
+    calendar credential never appears in the process list."""
+    try:
+        budget = min(FETCH_TOTAL_DEADLINE, max(0.001, float(argv[0])))
+        raw_url = sys.stdin.buffer.read(MAX_SOURCE_CHARS + 1)
+        if len(raw_url) > MAX_SOURCE_CHARS:
+            raise ValueError("calendar URL is too long")
+        url = raw_url.decode("utf-8", errors="strict")
+        if not url.lower().startswith("https://"):
+            raise ValueError("calendar URL is not https")
+        payload = _network_fetch(url, budget)
+        sys.stdout.buffer.write(payload)
+        return 0
+    except _FetchTooLarge as exc:
+        sys.stderr.write(str(exc)[:1_000])
+        return 1
+    except _FetchTimedOut as exc:
+        sys.stderr.write(str(exc)[:1_000])
+        return 1
+    except urllib.error.HTTPError as exc:
+        # HTTPError carries the complete request URL as an attribute. Emit
+        # only the status, never str/repr of objects that may contain the
+        # credential-bearing path.
+        sys.stderr.write(f"calendar server returned HTTP {exc.code}")
+        return 1
+    except Exception:
+        # Network, TLS and redirect exceptions are deliberately generic here:
+        # some urllib exceptions embed the complete request URL.
+        sys.stderr.write("calendar network request failed")
+        return 1
+
+
+def _fetch_in_subprocess(url: str, deadline: float) -> bytes:
+    """Fetch behind a killable process boundary.
+
+    CPython cannot impose a timeout on libc getaddrinfo(). Keeping DNS,
+    redirect handling, TLS and response reads in this child lets the parent
+    enforce one actual wall-clock deadline over all of them.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _FetchTimedOut("fetch exceeded its overall deadline")
+    env = os.environ.copy()
+    env["MOKUZEN_FETCH_WORKER"] = "1"
+    worker = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "_fetch-worker", f"{remaining:.3f}"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        remaining = max(0.001, deadline - time.monotonic())
+        output, error = worker.communicate(url.encode("utf-8"), timeout=remaining)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+        worker.communicate()
+        raise _FetchTimedOut("fetch exceeded its overall deadline")
+    if len(output) > MAX_REMOTE_BYTES:
+        raise _FetchTooLarge(f"calendar exceeds {MAX_REMOTE_BYTES} bytes")
+    if worker.returncode != 0:
+        message = error.decode("utf-8", errors="replace")[:1_000] or "fetch worker failed"
+        raise urllib.error.URLError(message)
+    return output
 
 
 def fetch_remote(
@@ -460,31 +690,14 @@ def fetch_remote(
                 pass
         return "", f"{label}: skipped (this run's calendar time budget is spent)"
 
-    public = _is_public_host(urlsplit(normalized).hostname)
-    if public is None:
-        label = mask(source)
-        if target.exists():
-            try:
-                stale = _read_capped_no_follow(target, MAX_REMOTE_BYTES)
-                return stale, f"{label}: could not resolve host; using cached copy"
-            except OSError:
-                pass
-        return "", f"{label}: could not resolve host"
-    if not public:
-        label = mask(source)
-        return "", f"{label}: resolves to a private/internal address, refusing to fetch"
-
-    opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
-    request = urllib.request.Request(normalized, headers={"User-Agent": USER_AGENT})
     deadline = time.monotonic() + FETCH_TOTAL_DEADLINE
     if shared_deadline is not None:
         deadline = min(deadline, shared_deadline)
     try:
-        with opener.open(request, timeout=NETWORK_TIMEOUT) as response:
-            if not response.geturl().lower().startswith("https://"):
-                raise urllib.error.URLError("final URL is not https://")
-            raw = _read_capped_response(response, MAX_REMOTE_BYTES, deadline)
+        raw = _fetch_in_subprocess(normalized, deadline)
         text = raw.decode("utf-8", errors="replace")
+        if len(text.encode("utf-8")) > MAX_REMOTE_BYTES:
+            raise _FetchTooLarge("decoded calendar exceeds the cache byte cap")
         write_private(target, text)
         return text, None
     except (urllib.error.URLError, OSError, ValueError, _FetchTooLarge, _FetchTimedOut) as exc:
@@ -508,13 +721,9 @@ def read_source(
         text, warning = fetch_remote(source, max_age, force, shared_deadline)
         return ([text] if text else []), ([warning] if warning else [])
 
-    # The top-level path is what the user typed into their own config: if
-    # they point it at a symlink (an atomic-swap target some sync tools use),
-    # that is their call and we follow it, same as any other file they named.
-    # Inside a directory we walk ourselves, entries are not something the
-    # user individually vetted, so symlinked entries there are skipped —
-    # see _iter_ics_files.
     path = Path(source).expanduser()
+    if path.is_symlink():
+        return [], [f"{path}: symlinked calendar sources are not followed"]
     if path.is_dir():
         documents, warnings = [], []
         total_bytes = 0
@@ -535,7 +744,7 @@ def read_source(
         return documents, warnings
     if path.is_file():
         try:
-            return [_read_capped(path, MAX_ICS_FILE_BYTES)], []
+            return [_read_capped_no_follow(path, MAX_ICS_FILE_BYTES)], []
         except OSError as exc:
             return [], [f"{path}: {exc}"]
     return [], [f"{source}: no such file or directory"]
@@ -679,7 +888,7 @@ def parse_event(lines: list[str], calendar_name: str) -> dict | None:
             continue
         name, params, value = parsed
         if name == "UID":
-            event["uid"] = value.strip()[:MAX_FIELD_CHARS]
+            event["uid"] = value.strip()[:MAX_UID_CHARS]
         elif name == "SUMMARY":
             event["summary"] = unescape(value).strip()[:MAX_FIELD_CHARS]
         elif name == "LOCATION":
@@ -717,7 +926,7 @@ def parse_event(lines: list[str], calendar_name: str) -> dict | None:
                 if len(addresses) < MAX_EXDATES_PER_EVENT:
                     addresses.append(value.strip().lower()[:MAX_FIELD_CHARS])
 
-    if start is None:
+    if start is None or not event["uid"]:
         return None
 
     if end is None:
@@ -742,40 +951,83 @@ WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
 
 def parse_rrule(rule: str) -> dict:
+    chunks = rule.split(";")
+    if not chunks or len(chunks) > MAX_RULE_TOKENS:
+        raise ValueError("RRULE has too many fields")
     parsed: dict = {}
-    for chunk in rule.split(";")[:MAX_RULE_TOKENS]:
+    allowed = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH"}
+    for chunk in chunks:
         if "=" not in chunk:
-            continue
+            raise ValueError("RRULE field has no value")
         key, value = chunk.split("=", 1)
-        parsed[key.upper()] = value.upper()
+        key, value = key.upper(), value.upper()
+        if key not in allowed or not value or key in parsed:
+            raise ValueError(f"unsupported, empty or duplicate RRULE field: {key}")
+        parsed[key] = value
+
+    freq = parsed.get("FREQ")
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        raise ValueError("unsupported or missing RRULE FREQ")
+
+    def positive(name: str, maximum: int, default: int | None = None) -> int | None:
+        value = parsed.get(name)
+        if value is None:
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"RRULE {name} is not an integer")
+        if number <= 0 or number > maximum:
+            raise ValueError(f"RRULE {name} is outside 1..{maximum}")
+        return number
+
+    def integer_list(name: str, minimum: int, maximum: int, *, reject_zero=False) -> list[int]:
+        value = parsed.get(name)
+        if value is None:
+            return []
+        tokens = value.split(",")
+        if not tokens or len(tokens) > MAX_RULE_TOKENS:
+            raise ValueError(f"RRULE {name} has too many values")
+        result: list[int] = []
+        for token in tokens:
+            try:
+                number = int(token)
+            except ValueError:
+                raise ValueError(f"RRULE {name} contains a non-integer")
+            if number < minimum or number > maximum or (reject_zero and number == 0):
+                raise ValueError(f"RRULE {name} contains an out-of-range value")
+            result.append(number)
+        return result
+
+    parsed["_INTERVAL"] = positive("INTERVAL", MAX_RRULE_INTERVAL, 1)
+    parsed["_COUNT"] = positive("COUNT", MAX_RRULE_COUNT)
+    if parsed.get("COUNT") and parsed.get("UNTIL"):
+        raise ValueError("RRULE cannot contain both COUNT and UNTIL")
+    parsed["_BYMONTH"] = integer_list("BYMONTH", 1, 12)
+    parsed["_BYMONTHDAY"] = integer_list("BYMONTHDAY", -31, 31, reject_zero=True)
+
+    bydays: list[tuple[int | None, str]] = []
+    if parsed.get("BYDAY"):
+        tokens = parsed["BYDAY"].split(",")
+        if len(tokens) > MAX_RULE_TOKENS:
+            raise ValueError("RRULE BYDAY has too many values")
+        for token in tokens:
+            match = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", token)
+            if not match:
+                raise ValueError("RRULE BYDAY contains an invalid value")
+            ordinal_text, weekday = match.groups()
+            ordinal = int(ordinal_text) if ordinal_text else None
+            if ordinal is not None:
+                if ordinal == 0 or abs(ordinal) > 53 or freq in ("DAILY", "WEEKLY"):
+                    raise ValueError("RRULE BYDAY ordinal is invalid for this frequency")
+            bydays.append((ordinal, weekday))
+    parsed["_BYDAY"] = bydays
     return parsed
 
 
-def _clamped_int(value, maximum: int, default: int | None = None) -> int | None:
-    if not value:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    if parsed < 0:
-        return default
-    return min(parsed, maximum)
-
-
-def _int_list(value: str | None, limit: int = MAX_RULE_TOKENS) -> list[int] | None:
-    if not value:
-        return None
-    out = []
-    for chunk in value.split(",")[:limit]:
-        try:
-            out.append(int(chunk))
-        except ValueError:
-            continue
-    return out or None
-
-
-def byday_matches(day: date, tokens: list[str], freq: str) -> bool:
+def byday_matches(
+    day: date, tokens: list[tuple[int | None, str]], freq: str, bymonth: bool = False
+) -> bool:
     # `same` depends only on day.year/day.month/day.weekday(), which are fixed
     # for the whole call — not on which token is being checked. Building it
     # once here rather than per matching token is what keeps a rule with
@@ -783,27 +1035,15 @@ def byday_matches(day: date, tokens: list[str], freq: str) -> bool:
     # an O(366) scan that many times for a single day.
     same_cache: list | None = None
 
-    for token in tokens[:MAX_RULE_TOKENS]:
-        match = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", token)
-        if not match:
-            continue
-        ordinal, name = match.groups()
+    for ordinal, name in tokens:
         if day.weekday() != WEEKDAYS[name]:
             continue
-        if not ordinal:
+        if ordinal is None:
             return True
-        try:
-            position = int(ordinal)
-        except ValueError:
-            continue
-        if position == 0:
-            continue
-        # A signed ordinal ("-1MO" = last Monday) is meaningful; only its
-        # magnitude needs bounding against a hostile value.
-        position = max(-MAX_RULE_TOKENS, min(MAX_RULE_TOKENS, position))
+        position = ordinal
 
         if same_cache is None:
-            if freq == "MONTHLY":
+            if freq == "MONTHLY" or (freq == "YEARLY" and bymonth):
                 days_in_month = _calendar.monthrange(day.year, day.month)[1]
                 same_cache = [
                     d for d in range(1, days_in_month + 1)
@@ -817,7 +1057,7 @@ def byday_matches(day: date, tokens: list[str], freq: str) -> bool:
                         if candidate.weekday() == day.weekday():
                             same_cache.append(candidate)
 
-        needle = day.day if freq == "MONTHLY" else day
+        needle = day.day if freq == "MONTHLY" or (freq == "YEARLY" and bymonth) else day
         index = same_cache.index(needle) + 1
         if position > 0 and index == position:
             return True
@@ -828,20 +1068,20 @@ def byday_matches(day: date, tokens: list[str], freq: str) -> bool:
 
 def day_matches(day: date, rule: dict, seed: date) -> bool:
     freq = rule.get("FREQ", "")
-    interval = _clamped_int(rule.get("INTERVAL"), MAX_RRULE_INTERVAL, default=1) or 1
+    interval = rule["_INTERVAL"]
 
-    months = _int_list(rule.get("BYMONTH"))
+    months = rule["_BYMONTH"]
     if months and day.month not in months:
         return False
 
-    monthdays = _int_list(rule.get("BYMONTHDAY"))
+    monthdays = rule["_BYMONTHDAY"]
     if monthdays:
         days_in_month = _calendar.monthrange(day.year, day.month)[1]
         wanted = {d if d > 0 else days_in_month + d + 1 for d in monthdays}
         if day.day not in wanted:
             return False
 
-    bydays = rule["BYDAY"].split(",")[:MAX_RULE_TOKENS] if rule.get("BYDAY") else None
+    bydays = rule["_BYDAY"]
 
     if freq == "DAILY":
         if (day - seed).days % interval:
@@ -871,9 +1111,11 @@ def day_matches(day: date, rule: dict, seed: date) -> bool:
         if (day.year - seed.year) % interval:
             return False
         if bydays:
-            return byday_matches(day, bydays, freq)
-        if monthdays or months:
+            return byday_matches(day, bydays, freq, bool(months))
+        if monthdays:
             return True
+        if months:
+            return day.day == seed.day
         return (day.month, day.day) == (seed.month, seed.day)
 
     return False
@@ -882,6 +1124,34 @@ def day_matches(day: date, rule: dict, seed: date) -> bool:
 def _months_between(seed: date, months_ahead: int) -> tuple[int, int]:
     total = seed.month - 1 + months_ahead
     return seed.year + total // 12, total % 12 + 1
+
+
+def _weekly_occurrences_before(
+    seed_date: date,
+    interval: int,
+    bydays: list[tuple[int | None, str]],
+    exclusive: date,
+) -> int:
+    """Count a plain weekly rule before a date without walking every day.
+
+    Weekly BYDAY ordinals are rejected by parse_rrule(), so each selected
+    weekday forms one arithmetic sequence separated by interval weeks.
+    """
+    if exclusive <= seed_date:
+        return 0
+    weekdays = {WEEKDAYS[name] for ordinal, name in bydays if ordinal is None}
+    if not weekdays:
+        weekdays = {seed_date.weekday()}
+    seed_week = seed_date - timedelta(days=seed_date.weekday())
+    stride_days = 7 * interval
+    total = 0
+    for weekday in weekdays:
+        first = seed_week + timedelta(days=weekday)
+        if first < seed_date:
+            first += timedelta(days=stride_days)
+        if first < exclusive:
+            total += ((exclusive - timedelta(days=1) - first).days // stride_days) + 1
+    return total
 
 
 def _fast_forward_count_anchor(
@@ -961,7 +1231,7 @@ def expand(event: dict, window_start: datetime, window_end: datetime) -> list[da
         return [occurrence] if window_start <= occurrence <= window_end else []
 
     rule = parse_rrule(event["rrule"])
-    count = _clamped_int(rule.get("COUNT"), MAX_RRULE_COUNT)
+    count = rule["_COUNT"]
     until = None
     if rule.get("UNTIL"):
         parsed_until, _ = parse_dt(rule["UNTIL"], {})
@@ -969,6 +1239,8 @@ def expand(event: dict, window_start: datetime, window_end: datetime) -> list[da
             until = parsed_until
         elif isinstance(parsed_until, date):
             until = datetime.combine(parsed_until, dtime(23, 59, 59), tzinfo=local_zone())
+        else:
+            raise ValueError("RRULE UNTIL is invalid")
 
     excluded = set()
     for item in event["exdates"][:MAX_EXDATES_PER_EVENT]:
@@ -982,18 +1254,27 @@ def expand(event: dict, window_start: datetime, window_end: datetime) -> list[da
     # arithmetically for the common shapes (no BYDAY/BYMONTHDAY/BYMONTH);
     # everything else still walks, but now from a well-bounded starting
     # point rather than from a possibly decades-old seed. `count is not
-    # None` throughout on purpose — a rule that spells out COUNT=0 is a
-    # (degenerate) bounded rule, not an unbounded one, and `if count:` would
-    # treat it as the latter.
+    # None` throughout on purpose: zero and malformed values were already
+    # rejected by parse_rrule(), so no invalid COUNT can become unbounded.
     freq = rule.get("FREQ", "")
-    interval = _clamped_int(rule.get("INTERVAL"), MAX_RRULE_INTERVAL, default=1) or 1
+    interval = rule["_INTERVAL"]
     simple_shape = (
         freq in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY")
-        and not rule.get("BYDAY") and not rule.get("BYMONTHDAY") and not rule.get("BYMONTH")
+        and not rule["_BYDAY"] and not rule["_BYMONTHDAY"] and not rule["_BYMONTH"]
     )
 
-    if count is not None and simple_shape:
-        before = window_start.date() - timedelta(days=1)
+    before = window_start.date() - timedelta(days=1)
+    weekly_shape = (
+        freq == "WEEKLY" and not rule["_BYMONTHDAY"] and not rule["_BYMONTH"]
+    )
+    if count is not None and weekly_shape:
+        cursor = max(seed_date, before)
+        seen = _weekly_occurrences_before(
+            seed_date, interval, rule["_BYDAY"], cursor
+        )
+        if seen >= count:
+            return []
+    elif count is not None and simple_shape:
         cursor, seen = _fast_forward_count_anchor(seed_date, freq, interval, before)
         if seen >= count:
             return []
@@ -1084,6 +1365,8 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
     warnings: list[str] = []
     events: list[dict] = []
     overrides: dict[tuple[str, str], dict] = {}
+    total_documents = 0
+    total_bytes = 0
     # Shared across every remote source in this one call, so N slow calendars
     # cost roughly the same as one, not N times as much — see fetch_remote.
     deadline = time.monotonic() + FETCH_TOTAL_DEADLINE
@@ -1095,6 +1378,19 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
         warnings.extend(source_warnings)
         label = Path(str(source)).name if not is_remote(str(source)) else "remote"
         for document in documents:
+            document_bytes = len(document.encode("utf-8"))
+            if total_documents >= MAX_TOTAL_DOCUMENTS:
+                warnings.append(
+                    f"stopped after {MAX_TOTAL_DOCUMENTS} calendar documents; the rest were ignored"
+                )
+                return events, warnings[:MAX_WARNINGS]
+            if total_bytes + document_bytes > MAX_TOTAL_ICS_BYTES:
+                warnings.append(
+                    f"stopped after the {MAX_TOTAL_ICS_BYTES}-byte aggregate calendar budget"
+                )
+                return events, warnings[:MAX_WARNINGS]
+            total_documents += 1
+            total_bytes += document_bytes
             parsed_events, truncated = split_events(document)
             if truncated:
                 warnings.append(
@@ -1102,6 +1398,11 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                     "the rest were ignored"
                 )
             for lines in parsed_events:
+                if len(events) >= MAX_TOTAL_EVENTS:
+                    warnings.append(
+                        f"stopped after {MAX_TOTAL_EVENTS} total events; the rest were ignored"
+                    )
+                    return events, warnings[:MAX_WARNINGS]
                 try:
                     event = parse_event(lines, label)
                 except Exception:
@@ -1114,6 +1415,44 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                 events.append(event)
 
     return events, warnings[:MAX_WARNINGS]
+
+
+class _RegexTimedOut(Exception):
+    pass
+
+
+def _safe_regex_search(pattern: str, text: str) -> bool:
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return False
+    # Do not truncate before matching. Truncation changes regex semantics at
+    # the artificial end of the string: for example, ``(a+)+$`` incorrectly
+    # matches the truncated prefix of ``a * limit + !``. Parsed calendar
+    # fields are already capped at this limit; reject an oversized value here
+    # as a defence-in-depth measure instead of manufacturing a false match.
+    if len(text) > MAX_REGEX_INPUT_CHARS:
+        return False
+    bounded_text = text
+    if not hasattr(signal, "setitimer"):
+        # Omarchy is Linux and always takes the timed path. This fallback keeps
+        # diagnostics usable on platforms that lack POSIX interval timers.
+        return compiled.search(bounded_text) is not None
+
+    def timed_out(signum, frame):
+        raise _RegexTimedOut()
+
+    previous_handler = signal.signal(signal.SIGALRM, timed_out)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, MAX_REGEX_SECONDS)
+    try:
+        return compiled.search(bounded_text) is not None
+    except _RegexTimedOut:
+        return False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
 
 def wanted(event: dict, cfg: dict) -> bool:
@@ -1129,11 +1468,8 @@ def wanted(event: dict, cfg: dict) -> bool:
         if mine and (mine & declined):
             return False
     for pattern in cfg.get("ignoreTitles", []):
-        try:
-            if re.search(str(pattern), event.get("summary", ""), re.IGNORECASE):
-                return False
-        except re.error:
-            continue
+        if _safe_regex_search(pattern, event.get("summary", "")):
+            return False
     return True
 
 
@@ -1148,17 +1484,18 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
             overridden.add((event["uid"], str(event["recurrence_id"])))
 
     out = []
+    out_bytes = 2  # JSON list brackets
     # Each event's own walk is bounded (see expand()'s MAX_EXPAND_SECONDS),
     # but many maximally-expensive events must not be able to add those
     # bounds up into minutes — this is the budget for the whole batch.
     expand_deadline = time.monotonic() + MAX_TOTAL_EXPAND_SECONDS
     truncated = False
     for event in events:
-        if not wanted(event, cfg):
-            continue
         if time.monotonic() > expand_deadline:
             truncated = True
             break
+        if not wanted(event, cfg):
+            continue
         try:
             event_starts = expand(event, window_start, window_end)
         except Exception:
@@ -1166,26 +1503,41 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
             # of the agenda.
             continue
         for start in event_starts:
+            if len(out) >= MAX_OCCURRENCES:
+                warnings.append(
+                    f"stopped after {MAX_OCCURRENCES} occurrences; the rest were ignored"
+                )
+                out.sort(key=lambda item: item["start"])
+                return out, warnings[:MAX_WARNINGS]
             if event["recurrence_id"] is None and (event["uid"], str(start)) in overridden:
                 continue
             length = event["end"] - event["start"] if not event["all_day"] else timedelta(days=1)
             link = find_link(event)
             if cfg.get("onlyWithLink") and not link:
                 continue
-            out.append(
-                {
-                    "uid": event["uid"],
-                    "occurrenceId": f"{event['uid']}@{int(start.timestamp())}",
-                    "summary": event["summary"] or "(no title)",
-                    "location": event["location"],
-                    "link": link,
-                    "calendar": event["calendar"],
-                    "allDay": event["all_day"],
-                    "start": int(start.timestamp()),
-                    "end": int((start + length).timestamp()),
-                    "startsIn": int((start - now).total_seconds()),
-                }
-            )
+            item = {
+                "uid": event["uid"][:MAX_UID_CHARS],
+                "occurrenceId": f"{event['uid']}@{int(start.timestamp())}"[:768],
+                "summary": (event["summary"] or "(no title)")[:MAX_FIELD_CHARS],
+                "location": event["location"][:MAX_FIELD_CHARS],
+                "link": link[:MAX_LINK_CHARS],
+                "calendar": event["calendar"][:MAX_SOURCE_CHARS],
+                "allDay": event["all_day"],
+                "start": int(start.timestamp()),
+                "end": int((start + length).timestamp()),
+                "startsIn": int((start - now).total_seconds()),
+            }
+            item_bytes = len(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ) + 1
+            if out_bytes + item_bytes > MAX_OCCURRENCE_PAYLOAD_BYTES:
+                warnings.append(
+                    f"stopped after the {MAX_OCCURRENCE_PAYLOAD_BYTES}-byte occurrence budget"
+                )
+                out.sort(key=lambda entry: entry["start"])
+                return out, warnings[:MAX_WARNINGS]
+            out.append(item)
+            out_bytes += item_bytes
 
     if truncated:
         warnings.append(
@@ -1204,7 +1556,35 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
 def write_config(path: Path, data: dict) -> None:
     # The file holds secret calendar addresses; write_private keeps it
     # owner-only and atomic.
-    write_private(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    if len(serialized.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise SystemExit(f"mokuzen: configuration exceeds {MAX_CONFIG_BYTES} bytes")
+    write_private(path, serialized)
+
+
+def _count_documents_bounded(
+    documents: list[str], budget: dict[str, int]
+) -> tuple[int, str | None]:
+    """Count events while sharing the same aggregate caps as collect()."""
+    count = 0
+    for document in documents:
+        if budget["documents"] >= MAX_TOTAL_DOCUMENTS:
+            return count, f"stopped after {MAX_TOTAL_DOCUMENTS} calendar documents"
+        if budget["events"] >= MAX_TOTAL_EVENTS:
+            return count, f"stopped after {MAX_TOTAL_EVENTS} total events"
+        document_bytes = len(document.encode("utf-8"))
+        if budget["bytes"] + document_bytes > MAX_TOTAL_ICS_BYTES:
+            return count, f"stopped after the {MAX_TOTAL_ICS_BYTES}-byte calendar budget"
+        budget["documents"] += 1
+        budget["bytes"] += document_bytes
+        parsed_count = len(split_events(document)[0])
+        remaining = MAX_TOTAL_EVENTS - budget["events"]
+        accepted = min(parsed_count, remaining)
+        count += accepted
+        budget["events"] += accepted
+        if parsed_count > remaining:
+            return count, f"stopped after {MAX_TOTAL_EVENTS} total events"
+    return count, None
 
 
 def cmd_setup(args) -> int:
@@ -1212,13 +1592,19 @@ def cmd_setup(args) -> int:
     data: dict = {}
     if path.exists():
         try:
-            loaded = json.loads(_read_capped(path, MAX_CONFIG_BYTES))
-            if isinstance(loaded, dict):
-                data = loaded
-        except ValueError:
+            loaded = json.loads(_read_capped_no_follow(path, MAX_CONFIG_BYTES))
+        except json.JSONDecodeError:
             raise SystemExit(f"mokuzen: {path} is not valid JSON; fix or delete it first")
         except OSError as exc:
             raise SystemExit(f"mokuzen: cannot read {path}: {exc}")
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"mokuzen: {path} must contain a JSON object")
+        try:
+            data = _validate_config(loaded, path)
+        except ValueError as exc:
+            raise SystemExit(f"mokuzen: invalid configuration in {path}: {exc}")
+        data.pop("_path", None)
+        data.pop("_exists", None)
 
     calendars = data.get("calendars")
     if isinstance(calendars, str):
@@ -1257,6 +1643,15 @@ def cmd_setup(args) -> int:
             changed = True
             print(f"set {key} = {value}")
 
+    try:
+        normalized = _validate_config(data, path)
+    except ValueError as exc:
+        raise SystemExit(f"mokuzen: invalid configuration: {exc}")
+    normalized.pop("_path", None)
+    normalized.pop("_exists", None)
+    data = normalized
+    calendars = data["calendars"]
+
     if args.show or not changed:
         shown = dict(data)
         shown["calendars"] = [mask(str(c)) for c in calendars]
@@ -1274,17 +1669,22 @@ def cmd_setup(args) -> int:
     # A secret address that 404s is the failure people actually hit, and they
     # hit it silently. Say so now rather than at 9:59am. One shared deadline
     # across every calendar being verified, so a long list of them can't add
-    # up to an unbounded run — see collect()'s use of the same pattern.
+    # up to an unbounded run - see collect()'s use of the same pattern.
     problems = 0
     verify_deadline = time.monotonic() + SETUP_VERIFY_DEADLINE
+    verify_budget = {"documents": 0, "bytes": 0, "events": 0}
     for source in calendars:
         documents, warnings = read_source(str(source), 0, force=True, shared_deadline=verify_deadline)
-        count = sum(len(split_events(document)[0]) for document in documents)
+        count, budget_warning = _count_documents_bounded(documents, verify_budget)
+        if budget_warning:
+            warnings.append(budget_warning)
         if warnings or not documents:
             problems += 1
             print(f"  ✗ {warnings[0] if warnings else mask(str(source)) + ': nothing readable'}")
         else:
             print(f"  ✓ {mask(str(source))}: {count} events")
+        if budget_warning:
+            break
     return 1 if problems else 0
 
 
@@ -1311,6 +1711,56 @@ def config_fingerprint(cfg: dict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def _validated_cached_occurrences(payload: dict) -> tuple[list[dict], list[str]]:
+    """Return a small, typed projection of the owner-only occurrence cache.
+
+    The cache is still parsed as untrusted input: a same-user process or a
+    damaged sync can replace it, and its contents must not become an
+    unbounded QML model just because the byte cap happened to accept it.
+    """
+    raw_events = payload.get("events")
+    raw_warnings = payload.get("warnings")
+    if not isinstance(raw_events, list) or len(raw_events) > MAX_OCCURRENCES:
+        raise ValueError("invalid occurrence cache cardinality")
+    if not isinstance(raw_warnings, list) or len(raw_warnings) > MAX_WARNINGS:
+        raise ValueError("invalid occurrence warning cardinality")
+
+    string_limits = {
+        "uid": MAX_UID_CHARS,
+        "occurrenceId": 768,
+        "summary": MAX_FIELD_CHARS,
+        "location": MAX_FIELD_CHARS,
+        "link": MAX_LINK_CHARS,
+        "calendar": MAX_SOURCE_CHARS,
+    }
+    events: list[dict] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid occurrence cache event")
+        item: dict = {}
+        for key, limit in string_limits.items():
+            value = raw.get(key)
+            if not isinstance(value, str) or len(value) > limit:
+                raise ValueError(f"invalid cached occurrence {key}")
+            item[key] = value
+        if not isinstance(raw.get("allDay"), bool):
+            raise ValueError("invalid cached occurrence allDay")
+        item["allDay"] = raw["allDay"]
+        for key in ("start", "end", "startsIn"):
+            value = raw.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or abs(value) > 10**12:
+                raise ValueError(f"invalid cached occurrence {key}")
+            item[key] = value
+        events.append(item)
+
+    warnings: list[str] = []
+    for warning in raw_warnings:
+        if not isinstance(warning, str) or len(warning) > MAX_WARNING_CHARS:
+            raise ValueError("invalid cached occurrence warning")
+        warnings.append(warning)
+    return events, warnings
+
+
 def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
     """Expanding a real calendar costs the best part of a second — a 6 MB
     export with ten thousand events is not unusual. The poll that asks "is
@@ -1329,6 +1779,8 @@ def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
     if not force:
         try:
             cached = json.loads(_read_capped_no_follow(path, MAX_CACHE_BYTES))
+            if not isinstance(cached, dict):
+                raise ValueError("occurrence cache must be an object")
             usable = (
                 cached.get("fingerprint") == fingerprint
                 and now.timestamp() - float(cached.get("computed", 0)) < max_age
@@ -1336,7 +1788,8 @@ def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
                 and float(cached.get("horizonEnd", 0)) > now.timestamp() + 3600
             )
             if usable:
-                return cached.get("events", []), cached.get("warnings", []), True
+                events, warnings = _validated_cached_occurrences(cached)
+                return events, warnings, True
         except (OSError, ValueError, TypeError):
             pass
 
@@ -1348,8 +1801,10 @@ def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
         "events": items,
         "warnings": warnings,
     }
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
-        write_private(path, json.dumps(payload))
+        if len(serialized.encode("utf-8")) <= MAX_CACHE_BYTES:
+            write_private(path, serialized)
     except OSError:
         pass
     return items, warnings, False
@@ -1359,10 +1814,19 @@ def cached_occurrences(cfg: dict, now: datetime, force: bool = False):
 # commands
 
 
+def cmd_config(args) -> int:
+    """Emit only the validated, bounded fields consumed by Service.qml."""
+    cfg = load_config(args.config)
+    json.dump({key: cfg[key] for key in DEFAULTS}, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def cmd_check(args) -> int:
     cfg = load_config(args.config)
     now = datetime.now(timezone.utc).astimezone()
     lead = args.window if args.window is not None else int(cfg.get("leadSeconds", 60))
+    lead = max(0, min(86_400, lead))
     items, warnings, from_cache = cached_occurrences(cfg, now)
 
     upcoming = []
@@ -1381,7 +1845,7 @@ def cmd_check(args) -> int:
         "event": upcoming[0] if upcoming else None,
         "warnings": warnings,
     }
-    json.dump(payload, sys.stdout)
+    json.dump(payload, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
 
@@ -1389,8 +1853,15 @@ def cmd_check(args) -> int:
 def cmd_list(args) -> int:
     cfg = load_config(args.config)
     now = datetime.now(timezone.utc).astimezone()
-    items, warnings = occurrences(cfg, now, timedelta(days=args.days))
-    json.dump({"events": items[: args.limit], "warnings": warnings}, sys.stdout, indent=2)
+    days = max(1, min(366, args.days))
+    limit = max(1, min(500, args.limit))
+    items, warnings = occurrences(cfg, now, timedelta(days=days))
+    json.dump(
+        {"events": items[:limit], "warnings": warnings},
+        sys.stdout,
+        indent=2,
+        ensure_ascii=False,
+    )
     sys.stdout.write("\n")
     return 0
 
@@ -1406,6 +1877,7 @@ def cmd_refresh(args) -> int:
             "warnings": warnings,
         },
         sys.stdout,
+        ensure_ascii=False,
     )
     sys.stdout.write("\n")
     return 1 if warnings else 0
@@ -1422,11 +1894,14 @@ def cmd_doctor(args) -> int:
         "warnings": [],
     }
     doctor_deadline = time.monotonic() + FETCH_TOTAL_DEADLINE
+    doctor_budget = {"documents": 0, "bytes": 0, "events": 0}
     for source in cfg.get("calendars", []):
         documents, warnings = read_source(
             str(source), int(cfg.get("refreshSeconds", 300)), shared_deadline=doctor_deadline
         )
-        count = sum(len(split_events(document)[0]) for document in documents)
+        count, budget_warning = _count_documents_bounded(documents, doctor_budget)
+        if budget_warning:
+            warnings.append(budget_warning)
         report["calendars"].append(
             {
                 "source": ("<remote>" if is_remote(str(source)) else str(source)),
@@ -1437,17 +1912,22 @@ def cmd_doctor(args) -> int:
             }
         )
         report["warnings"].extend(warnings)
+        if budget_warning:
+            break
     items, more = occurrences(cfg, now, timedelta(days=7))
     report["warnings"].extend(more)
     report["warnings"] = report["warnings"][:MAX_WARNINGS]
     report["next7Days"] = len(items)
     report["nextUp"] = items[0] if items else None
-    json.dump(report, sys.stdout, indent=2)
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
 
 
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["_fetch-worker"]:
+        return _fetch_worker_main(argv[1:])
+
     # Make this process its own process-group leader, so whoever launched us
     # (Service.qml's Process) can reliably reach the whole group with one
     # `kill -SIGNAL -PID`, including any child this script might ever spawn —
@@ -1460,7 +1940,7 @@ def main(argv: list[str]) -> int:
     # only needs when something else (Quickshell, whose subprocess has no
     # pty) is holding the leash.
     try:
-        if not sys.stdin.isatty():
+        if os.environ.get("MOKUZEN_FETCH_WORKER") != "1" and not sys.stdin.isatty():
             os.setpgid(0, 0)
     except (OSError, AttributeError, ValueError):
         # OSError: setpgid itself refused. AttributeError/ValueError: stdin
@@ -1471,6 +1951,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="mokuzen-agenda", description=__doc__)
     parser.add_argument("--config", help="path to mokuzen.json")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    config = sub.add_parser("config", help=argparse.SUPPRESS)
+    config.set_defaults(func=cmd_config)
 
     check = sub.add_parser("check", help="print the next occurrence inside the lead window")
     check.add_argument("--window", type=int, help="lead window in seconds (overrides config)")

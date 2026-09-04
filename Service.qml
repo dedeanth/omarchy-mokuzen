@@ -21,14 +21,6 @@ Item {
   // wherever the user installed it.
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
   readonly property string agendaScript: pluginDir + "bin/mokuzen-agenda"
-  // Mirrors bin/mokuzen-agenda's own config_path(): honor XDG_CONFIG_HOME
-  // when set, rather than assuming ~/.config, so the panel watches the same
-  // file the script actually reads.
-  readonly property string configHome: {
-    var xdg = Quickshell.env("XDG_CONFIG_HOME")
-    return (xdg && xdg.length > 0) ? xdg : (Quickshell.env("HOME") + "/.config")
-  }
-  readonly property string configPath: configHome + "/omarchy/mokuzen.json"
 
   // ---- configuration -----------------------------------------------------
 
@@ -56,10 +48,13 @@ Item {
   property var upcoming: []
   readonly property var calendars: Array.isArray(config.calendars) ? config.calendars : []
   property bool busy: false
+  property bool refreshAfterConfigLoad: false
+  property bool configReadAgain: false
 
   // occurrenceId -> epoch seconds. Handled means "do not raise this again":
   // either the user dealt with it, or it is sleeping until a later moment.
   property var suppressed: ({})
+  readonly property int maxSuppressed: 256
 
   PersistentProperties {
     id: persisted
@@ -69,7 +64,8 @@ Item {
 
   Component.onCompleted: {
     try {
-      var restored = JSON.parse(persisted.suppressedJson)
+      var saved = String(persisted.suppressedJson || "")
+      var restored = saved.length <= 262144 ? JSON.parse(saved) : ({})
       if (restored && typeof restored === "object") root.suppressed = restored
     } catch (e) {
       root.suppressed = ({})
@@ -85,9 +81,15 @@ Item {
   // keeps the persisted blob from growing for the life of the session.
   function prune() {
     var now = nowSeconds()
-    var next = ({})
+    var rows = []
     for (var id in root.suppressed) {
-      if (Number(root.suppressed[id]) > now) next[id] = root.suppressed[id]
+      var until = Number(root.suppressed[id])
+      if (Number.isFinite(until) && until > now) rows.push({ id: id, until: until })
+    }
+    rows.sort(function(a, b) { return b.until - a.until })
+    var next = ({})
+    for (var i = 0; i < Math.min(rows.length, root.maxSuppressed); i++) {
+      next[rows[i].id] = rows[i].until
     }
     root.suppressed = next
     persisted.suppressedJson = JSON.stringify(next)
@@ -97,9 +99,9 @@ Item {
     if (!occurrenceId) return
     var next = ({})
     for (var id in root.suppressed) next[id] = root.suppressed[id]
-    next[occurrenceId] = untilSeconds
+    next[String(occurrenceId).slice(0, 768)] = Math.min(Number(untilSeconds), nowSeconds() + 604800)
     root.suppressed = next
-    persisted.suppressedJson = JSON.stringify(next)
+    prune()
   }
 
   function isSuppressed(occurrenceId) {
@@ -185,20 +187,83 @@ Item {
   // full, and a shoulder-surfed screenshot must not give the calendar away.
   function maskCalendar(source) {
     var text = String(source || "")
-    if (!/^(https?|webcal):\/\//.test(text)) return text
-    var match = text.match(/^[a-z]+:\/\/([^\/]+)\/(.*)$/)
+    if (!/^(https?|webcal):\/\//i.test(text)) return text
+    var match = text.match(/^[a-z]+:\/\/([^\/]+)/i)
     if (!match) return "remote calendar"
-    var tail = match[2].length > 10 ? match[2].slice(-10) : match[2]
-    return match[1] + "/…" + tail
+    return match[1].replace(/^.*@/, "") + "/<redacted>"
+  }
+
+  // Never load mokuzen.json directly into the shell. Python applies strict
+  // byte, schema and cardinality limits, then emits only bounded fields.
+  function loadConfig(refreshAfter) {
+    if (refreshAfter) root.refreshAfterConfigLoad = true
+    if (configReader.running) {
+      root.configReadAgain = true
+      return
+    }
+    configReaderWatchdog.restart()
+    configReader.running = true
+  }
+
+  Process {
+    id: configReader
+    command: ["python3", root.agendaScript, "config"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          root.config = (parsed && typeof parsed === "object") ? parsed : ({})
+          if (root.lastWarning.indexOf("mokuzen.json") === 0) root.lastWarning = ""
+          if (root.refreshAfterConfigLoad && !root.configReadAgain) {
+            root.refreshAfterConfigLoad = false
+            Qt.callLater(function() {
+              root.refreshUpcoming()
+              root.check()
+            })
+          }
+        } catch (e) {
+          root.config = ({})
+          root.lastWarning = "mokuzen.json is invalid or too large"
+        }
+      }
+    }
+    onExited: function(exitCode) {
+      configReaderWatchdog.stop()
+      if (exitCode !== 0) {
+        root.config = ({})
+        root.lastWarning = "mokuzen.json is invalid or unreadable"
+      }
+      if (root.configReadAgain) {
+        root.configReadAgain = false
+        Qt.callLater(function() { root.loadConfig(false) })
+      }
+    }
+  }
+
+  Timer {
+    id: configReaderWatchdog
+    interval: 10000
+    repeat: false
+    onTriggered: root.killHard(configReader)
+  }
+
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.loadConfig(false)
   }
 
   // ---- hard deadlines on every Python child -------------------------------
   //
   // bin/mokuzen-agenda now bounds its own memory and CPU use against a
   // hostile calendar, but the process boundary is the last line of defense:
-  // a wedged filesystem, a hung DNS lookup outside the script's own network
-  // timeout, or a future regression must not be able to sit inside the shell
-  // process forever. main() makes the script its own process-group leader
+  // a wedged filesystem or a future regression must not be able to sit inside
+  // the shell process forever. Network work also runs in a disposable child
+  // so its deadline covers DNS, TLS, redirects and body reads. main() makes
+  // the script its own process-group leader
   // (os.setpgid(0, 0)) whenever it isn't attached to a terminal — which a
   // Process launched from here never is — deliberately not a `setsid`
   // wrapper, since that utility only forks when the *caller* is already a
@@ -246,9 +311,8 @@ Item {
 
   Timer {
     id: agendaListWatchdog
-    // Python's own shared fetch deadline (FETCH_TOTAL_DEADLINE) plus one
-    // worst-case socket-read overshoot is ~23s; this stays comfortably
-    // above that regardless of how many calendars are configured.
+    // Above Python's 15-second shared fetch deadline, with room for parsing
+    // and clean shutdown regardless of how many calendars are configured.
     interval: 30000
     repeat: false
     onTriggered: root.killHard(agendaList)
@@ -266,12 +330,16 @@ Item {
   //
   // Every write goes through the same `mokuzen-agenda setup` the command line
   // uses, so there is one implementation of "what a valid config looks like"
-  // and one file to back up. The FileView above notices the result.
+  // and one file to back up. The bounded reader above notices the result.
 
   property var pendingConfigCommands: []
 
   function runConfig(args) {
     var queued = root.pendingConfigCommands.slice()
+    if (queued.length >= 32) {
+      root.lastWarning = "too many pending configuration changes"
+      return
+    }
     queued.push(args)
     root.pendingConfigCommands = queued
     if (!configProcess.running) startNextConfig()
@@ -297,10 +365,10 @@ Item {
       // A non-zero exit here is usually "that address does not answer", which
       // the panel surfaces; the write itself already happened.
       configWatchdog.stop()
-      root.startNextConfig()
-      if (root.pendingConfigCommands.length === 0) {
-        root.refreshUpcoming()
-        root.check()
+      if (root.pendingConfigCommands.length > 0) root.startNextConfig()
+      else {
+        root.busy = false
+        root.loadConfig(true)
       }
     }
   }
@@ -308,8 +376,8 @@ Item {
   Timer {
     id: configWatchdog
     // Setup verifies every configured calendar over the network before
-    // returning, against its own shared SETUP_VERIFY_DEADLINE (45s) plus
-    // one worst-case socket-read overshoot — this stays above that.
+    // returning. This stays above its own 45-second shared verification
+    // deadline, with room for parsing and clean shutdown.
     interval: 70000
     repeat: false
     onTriggered: root.killHard(configProcess)
@@ -373,24 +441,6 @@ Item {
     }
   }
 
-  FileView {
-    id: configFile
-    path: root.configPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: {
-      try {
-        var parsed = JSON.parse(text())
-        root.config = (parsed && typeof parsed === "object") ? parsed : ({})
-      } catch (e) {
-        console.warn("mokuzen: mokuzen.json is not valid JSON, ignoring it")
-        root.config = ({})
-      }
-    }
-    onLoadFailed: root.config = ({})
-    onFileChanged: reload()
-  }
-
   // If the plugin is disabled or reloaded while a Python child is mid-run,
   // that child must not outlive this component — Quickshell tearing down the
   // Service is not the same as the process tree ending on its own.
@@ -398,5 +448,6 @@ Item {
     killHard(agendaList)
     killHard(configProcess)
     killHard(agendaCheck)
+    killHard(configReader)
   }
 }
