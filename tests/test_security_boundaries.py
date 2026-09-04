@@ -186,6 +186,19 @@ class BoundaryTests(unittest.TestCase):
     def test_regex_search_still_accepts_a_bounded_match(self):
         self.assertTrue(AGENDA._safe_regex_search("planning$", "Weekly planning"))
 
+    def test_upcoming_list_excludes_occurrences_that_already_started(self):
+        now = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
+        epoch = int(now.timestamp())
+        items = [
+            {"start": epoch - 1},
+            {"start": epoch},
+            {"start": epoch + 1},
+        ]
+        self.assertEqual(
+            [item["start"] for item in AGENDA._upcoming_items(items, now)],
+            [epoch, epoch + 1],
+        )
+
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
     def test_capped_read_does_not_follow_leaf_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
