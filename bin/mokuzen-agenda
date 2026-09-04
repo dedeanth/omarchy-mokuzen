@@ -1496,8 +1496,16 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
             break
         if not wanted(event, cfg):
             continue
+        length = (
+            event["end"] - event["start"]
+            if not event["all_day"]
+            else timedelta(days=1)
+        )
+        # The alert path only needs a short grace period, but the bar also
+        # needs occurrences that started earlier and have not ended yet.
+        event_window_start = min(window_start, now - max(length, timedelta(minutes=5)))
         try:
-            event_starts = expand(event, window_start, window_end)
+            event_starts = expand(event, event_window_start, window_end)
         except Exception:
             # A malformed recurrence rule costs this one event, not the rest
             # of the agenda.
@@ -1511,7 +1519,6 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
                 return out, warnings[:MAX_WARNINGS]
             if event["recurrence_id"] is None and (event["uid"], str(start)) in overridden:
                 continue
-            length = event["end"] - event["start"] if not event["all_day"] else timedelta(days=1)
             link = find_link(event)
             if cfg.get("onlyWithLink") and not link:
                 continue
@@ -1850,10 +1857,18 @@ def cmd_check(args) -> int:
     return 0
 
 
-def _upcoming_items(items: list[dict], now: datetime) -> list[dict]:
-    """Exclude occurrences that have already started from the bar agenda."""
+def _split_agenda(items: list[dict], now: datetime) -> tuple[list[dict], list[dict]]:
+    """Split active meetings from future ones for the bar agenda."""
     cutoff = now.timestamp()
-    return [item for item in items if float(item["start"]) >= cutoff]
+    current = [
+        item
+        for item in items
+        if float(item["start"]) <= cutoff < float(item["end"])
+    ]
+    upcoming = [item for item in items if float(item["start"]) > cutoff]
+    # If meetings overlap, the one that started most recently gets the bar.
+    current.sort(key=lambda item: item["start"], reverse=True)
+    return current, upcoming
 
 
 def cmd_list(args) -> int:
@@ -1862,9 +1877,13 @@ def cmd_list(args) -> int:
     days = max(1, min(366, args.days))
     limit = max(1, min(500, args.limit))
     items, warnings = occurrences(cfg, now, timedelta(days=days))
-    items = _upcoming_items(items, now)
+    current, upcoming = _split_agenda(items, now)
     json.dump(
-        {"events": items[:limit], "warnings": warnings},
+        {
+            "current": current[:limit],
+            "events": upcoming[:limit],
+            "warnings": warnings,
+        },
         sys.stdout,
         indent=2,
         ensure_ascii=False,

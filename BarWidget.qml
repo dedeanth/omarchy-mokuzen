@@ -23,6 +23,8 @@ BarWidget {
   readonly property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function"
     ? bar.shell.serviceFor("io.github.dedeanth.mokuzen") : null
 
+  readonly property var currentEvents: service ? service.inProgress : []
+  readonly property var currentMeeting: currentEvents.length > 0 ? currentEvents[0] : null
   readonly property var events: service ? service.upcoming : []
   readonly property var nextEvent: events.length > 0 ? events[0] : null
   readonly property var calendars: service ? service.calendars : []
@@ -30,6 +32,7 @@ BarWidget {
 
   property int nowSeconds: Math.floor(Date.now() / 1000)
   readonly property int startsIn: nextEvent ? Number(nextEvent.start) - nowSeconds : -1
+  readonly property int endsIn: currentMeeting ? Number(currentMeeting.end) - nowSeconds : -1
   readonly property int leadSeconds: service ? Number(service.leadSeconds) || 60 : 60
 
   // "countdown" | "time" | "title". Set with:
@@ -40,9 +43,10 @@ BarWidget {
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  readonly property bool inMeeting: currentMeeting && endsIn > 0
   readonly property bool imminent: nextEvent && startsIn >= 0 && startsIn <= Math.max(leadSeconds, 300)
 
-  visible: !(hideWhenEmpty && configured && !nextEvent)
+  visible: !(hideWhenEmpty && configured && !currentMeeting && !nextEvent)
   implicitWidth: content.implicitWidth + Style.space(10)
   implicitHeight: bar ? bar.barSize : Style.space(22)
 
@@ -68,6 +72,7 @@ BarWidget {
 
   function barLabel() {
     if (!root.configured) return "set up"
+    if (root.inMeeting) return "En cours · " + root.shortDelay(root.endsIn)
     if (!root.nextEvent) return ""
     switch (root.labelStyle) {
     case "time": return root.clockOf(root.nextEvent.start)
@@ -83,7 +88,7 @@ BarWidget {
 
     Text {
       text: "󰃭"
-      color: root.imminent ? Color.urgent : root.foreground
+      color: root.imminent ? Color.urgent : (root.inMeeting ? Color.accent : root.foreground)
       font.family: root.fontFamily
       font.pixelSize: Style.bar.iconFont
     }
@@ -94,7 +99,7 @@ BarWidget {
       // In "title" mode this is the event summary from a calendar we do not
       // control.
       textFormat: Text.PlainText
-      color: root.imminent ? Color.urgent : root.foreground
+      color: root.imminent ? Color.urgent : (root.inMeeting ? Color.accent : root.foreground)
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
     }
@@ -204,10 +209,43 @@ BarWidget {
         spacing: Style.space(10)
 
         Text {
-          text: root.configured ? "Next up" : "Mokuzen is not set up yet"
+          text: root.configured
+            ? (root.currentMeeting ? "Now" : "Next up")
+            : "Mokuzen is not set up yet"
           color: Color.popups.text
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
+        }
+
+        RowLayout {
+          visible: !!root.currentMeeting
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+
+          Text {
+            text: root.currentMeeting ? root.shortDelay(root.endsIn) + " left" : ""
+            color: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            Layout.fillWidth: true
+            text: root.currentMeeting ? root.currentMeeting.summary : ""
+            textFormat: Text.PlainText
+            color: Color.popups.text
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+        }
+
+        Text {
+          visible: !!root.currentMeeting
+          text: "Next up"
+          color: Color.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
 
         // ---- the next meetings

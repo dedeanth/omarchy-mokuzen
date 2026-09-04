@@ -43,8 +43,9 @@ Item {
   property string lastWarning: ""
   property bool checking: false
 
-  // What the bar widget shows: the next day of meetings, refreshed on the
-  // agenda cadence rather than the poll cadence.
+  // What the bar widget shows: meetings in progress and the next day of
+  // meetings, refreshed on the agenda cadence rather than the poll cadence.
+  property var inProgress: []
   property var upcoming: []
   readonly property var calendars: Array.isArray(config.calendars) ? config.calendars : []
   property bool busy: false
@@ -285,6 +286,7 @@ Item {
 
   function refreshUpcoming() {
     if (!root.hasCalendars) {
+      root.inProgress = []
       root.upcoming = []
       return
     }
@@ -300,8 +302,10 @@ Item {
       onStreamFinished: {
         try {
           var parsed = JSON.parse(text)
+          root.inProgress = Array.isArray(parsed.current) ? parsed.current : []
           root.upcoming = Array.isArray(parsed.events) ? parsed.events : []
         } catch (e) {
+          root.inProgress = []
           root.upcoming = []
         }
       }

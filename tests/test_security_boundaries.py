@@ -186,18 +186,44 @@ class BoundaryTests(unittest.TestCase):
     def test_regex_search_still_accepts_a_bounded_match(self):
         self.assertTrue(AGENDA._safe_regex_search("planning$", "Weekly planning"))
 
-    def test_upcoming_list_excludes_occurrences_that_already_started(self):
+    def test_agenda_splits_current_and_upcoming_occurrences(self):
         now = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
         epoch = int(now.timestamp())
         items = [
-            {"start": epoch - 1},
-            {"start": epoch},
-            {"start": epoch + 1},
+            {"start": epoch - 300, "end": epoch - 1},
+            {"start": epoch - 200, "end": epoch + 600},
+            {"start": epoch - 20, "end": epoch + 300},
+            {"start": epoch + 60, "end": epoch + 3600},
         ]
-        self.assertEqual(
-            [item["start"] for item in AGENDA._upcoming_items(items, now)],
-            [epoch, epoch + 1],
-        )
+        current, upcoming = AGENDA._split_agenda(items, now)
+        self.assertEqual([item["start"] for item in current], [epoch - 20, epoch - 200])
+        self.assertEqual([item["start"] for item in upcoming], [epoch + 60])
+
+    def test_occurrences_include_an_event_already_in_progress(self):
+        now = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
+        event = {
+            "uid": "in-progress",
+            "summary": "Private meeting",
+            "location": "",
+            "description": "",
+            "url": "",
+            "conference": "",
+            "calendar": "test",
+            "status": "",
+            "rrule": "",
+            "exdates": [],
+            "recurrence_id": None,
+            "all_day": False,
+            "start": now - timedelta(hours=1),
+            "end": now + timedelta(hours=1),
+        }
+        with mock.patch.object(AGENDA, "collect", return_value=([event], [])):
+            items, warnings = AGENDA.occurrences(
+                dict(AGENDA.DEFAULTS), now, timedelta(days=1)
+            )
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["startsIn"], -3600)
 
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX O_NOFOLLOW")
     def test_capped_read_does_not_follow_leaf_symlink(self):
