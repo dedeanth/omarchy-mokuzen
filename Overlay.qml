@@ -2,15 +2,13 @@ import QtQuick
 import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 
 // The thing you cannot miss. A layer-shell surface on the overlay layer on
 // every screen — a meeting is just as easy to miss on the monitor you are not
-// looking at. The screen that had focus when it opened holds the keyboard; the
-// buttons work on all of them.
+// looking at. Keys and buttons work on all of them.
 //
 // The look: the wallpaper, blurred and dimmed, under a centred column — title,
 // time span, how long until it starts, the notes and calendar buttons, Join
@@ -32,14 +30,12 @@ Item {
   // Read by the shell to answer "is this plugin open?".
   property bool opened: false
 
-  // This surface takes exclusive keyboard focus the instant it appears, which
-  // means whatever the user was typing lands here. Swallow keys briefly so an
+  // This surface takes keyboard focus the instant it appears, which means
+  // whatever the user was typing lands here. Swallow keys briefly so an
   // in-flight keystroke cannot launch a browser or dismiss the alert unseen.
   property bool acceptsKeys: false
 
   property var event: null
-  // Name of the screen that takes the keyboard, chosen when the alert opens.
-  property string keyboardScreen: ""
   property int nowSeconds: Math.floor(Date.now() / 1000)
 
   // Shared by every screen, so opening the notes on one opens them on all.
@@ -91,7 +87,6 @@ Item {
     // The service is the source of truth when it has something to say.
     if (root.service && root.service.currentEvent) incoming = root.service.currentEvent
     if (incoming) root.event = incoming
-    root.keyboardScreen = focusedScreenName()
     root.nowSeconds = Math.floor(Date.now() / 1000)
     root.showNotes = false
     root.showLinkMenu = false
@@ -99,22 +94,6 @@ Item {
     root.acceptsKeys = false
     inputGuard.restart()
     root.opened = true
-  }
-
-  readonly property bool keyboardScreenPresent: {
-    for (var i = 0; i < Quickshell.screens.length; i++) {
-      if (String(Quickshell.screens[i].name) === root.keyboardScreen) return true
-    }
-    return false
-  }
-
-  function focusedScreenName() {
-    var monitor = Hyprland.focusedMonitor
-    var name = monitor ? String(monitor.name || "") : ""
-    for (var i = 0; i < Quickshell.screens.length; i++) {
-      if (Quickshell.screens[i].name === name) return name
-    }
-    return Quickshell.screens.length > 0 ? String(Quickshell.screens[0].name) : ""
   }
 
   function close() {
@@ -260,11 +239,6 @@ Item {
       id: window
 
       required property var modelData
-      // Only one surface can hold exclusive focus; two would fight over it.
-      // If that screen went away, the first remaining one takes over.
-      readonly property bool takesKeyboard: String(modelData.name) === root.keyboardScreen
-        || (!root.keyboardScreenPresent && Quickshell.screens.length > 0
-          && Quickshell.screens[0] === modelData)
 
       screen: modelData
       visible: root.opened
@@ -272,7 +246,11 @@ Item {
       color: "transparent"
       WlrLayershell.namespace: "mokuzen"
       WlrLayershell.layer: WlrLayer.Overlay
-      WlrLayershell.keyboardFocus: root.opened && takesKeyboard ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+      // Not Exclusive: Hyprland gives an exclusive layer the pointer too, which
+      // left the buttons dead on every other screen. On demand, the alert
+      // still takes the keyboard when it maps, and a click on any screen
+      // brings it there.
+      WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
       exclusionMode: ExclusionMode.Ignore
 
       // Fully opaque on purpose: the theme colour first, the blurred wallpaper
@@ -313,9 +291,9 @@ Item {
       FocusScope {
         id: scope
         anchors.fill: parent
-        focus: root.opened && window.takesKeyboard
+        focus: root.opened
 
-        onActiveFocusChanged: if (root.opened && window.takesKeyboard && !activeFocus) forceActiveFocus()
+        onActiveFocusChanged: if (root.opened && !activeFocus) forceActiveFocus()
 
         Keys.onPressed: function(keyEvent) {
           if (!root.acceptsKeys) {
