@@ -262,10 +262,10 @@ class BoundaryTests(unittest.TestCase):
             "start": datetime.min.replace(tzinfo=timezone.utc),
             "end": datetime.max.replace(tzinfo=timezone.utc),
         }
+        # maxMeetingHours would drop it before the lookback is computed.
+        cfg = dict(AGENDA.DEFAULTS, maxMeetingHours=0)
         with mock.patch.object(AGENDA, "collect", return_value=([event], [])):
-            items, warnings = AGENDA.occurrences(
-                dict(AGENDA.DEFAULTS), now, timedelta(days=1)
-            )
+            items, warnings = AGENDA.occurrences(cfg, now, timedelta(days=1))
         self.assertEqual(items, [])
         self.assertEqual(warnings, [])
 

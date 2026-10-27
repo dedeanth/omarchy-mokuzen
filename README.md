@@ -97,10 +97,11 @@ empty.
 | `autoDismissSeconds` | `0` | Close by itself this long after the start. `0` keeps it up. |
 | `ignoreAllDay` | `true` | Skip all-day events. |
 | `skipCancelled` | `true` | Skip cancelled events. |
-| `skipDeclined` | `true` | Skip events you declined — needs `selfEmails`. |
-| `selfEmails` | `[]` | Your addresses, used to recognise your own declines. |
+| `skipDeclined` | `true` | Skip events you declined. |
+| `selfEmails` | `[]` | Your addresses, used to recognise your own declines. A Google calendar's secret address already names its owner, so Google users can leave it empty. |
 | `ignoreTitles` | `[]` | Regular expressions; a matching title never alerts. Good for recurring reminders that aren't meetings. |
 | `onlyWithLink` | `false` | Only alert for events that carry a meeting link. |
+| `maxMeetingHours` | `12` | Timed events longer than this — holidays, trips, "for information" blocks — never alert. `0` disables the limit. |
 | `enabled` | `true` | Keep the plugin installed but silent. |
 
 Two more live on the bar entry, because they're about the bar and not your
@@ -118,7 +119,7 @@ omarchy bar set io.github.dedeanth.mokuzen hideWhenEmpty false --json
 | Key | Action |
 | --- | --- |
 | `Enter` | Join the meeting, then dismiss |
-| `S` | Snooze |
+| `S` | Snooze — it comes back after `snoozeSeconds`, even once the meeting has started |
 | `Esc` | Dismiss until the meeting is over |
 
 Keystrokes are ignored for the first three-quarters of a second, so whatever

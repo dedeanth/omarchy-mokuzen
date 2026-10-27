@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 try:
     from zoneinfo import ZoneInfo
@@ -66,6 +66,7 @@ DEFAULTS = {
     "selfEmails": [],
     "ignoreTitles": [],
     "onlyWithLink": False,
+    "maxMeetingHours": 12,
     "enabled": True,
 }
 
@@ -126,6 +127,7 @@ MAX_EMAIL_CHARS = 320
 MAX_REGEX_INPUT_CHARS = 2_000
 MAX_REGEX_SECONDS = 0.02
 MAX_CURRENT_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
+MAX_CHECK_CANDIDATES = 20
 MAX_ICS_DIR_DEPTH = 64
 
 
@@ -206,6 +208,7 @@ def _validate_config(loaded: dict, path: Path) -> dict:
         "snoozeSeconds": (30, 604_800),
         "graceSeconds": (0, 86_400),
         "autoDismissSeconds": (0, 86_400),
+        "maxMeetingHours": (0, 8_760),
     }
     for key, (minimum, maximum) in ranges.items():
         value = cfg.get(key)
@@ -868,17 +871,59 @@ def unescape(value: str) -> str:
     return out.replace("\\\\", "\\")
 
 
+# Outlook and Exchange publish Windows zone names in TZID. The common ones,
+# mapped to the IANA zone they mean; anything else falls back to local time.
+WINDOWS_ZONES = {
+    "romance standard time": "Europe/Paris",
+    "w. europe standard time": "Europe/Berlin",
+    "central europe standard time": "Europe/Budapest",
+    "central european standard time": "Europe/Warsaw",
+    "gmt standard time": "Europe/London",
+    "greenwich standard time": "Atlantic/Reykjavik",
+    "e. europe standard time": "Europe/Chisinau",
+    "fle standard time": "Europe/Kyiv",
+    "eastern standard time": "America/New_York",
+    "central standard time": "America/Chicago",
+    "mountain standard time": "America/Denver",
+    "pacific standard time": "America/Los_Angeles",
+    "utc": "UTC",
+}
+
+
 def zone_for(tzid: str | None):
     if not tzid or ZoneInfo is None:
         return None
+    name = WINDOWS_ZONES.get(tzid.strip().lower(), tzid.strip())
     try:
-        return ZoneInfo(tzid)
+        return ZoneInfo(name)
     except Exception:
         return None
 
 
+_LOCAL_ZONE = None
+
+
 def local_zone():
-    return datetime.now().astimezone().tzinfo
+    """The system's named zone, so floating times keep the right offset on
+    both sides of a daylight-saving change. A fixed offset taken from "now"
+    would put every floating event after the change an hour off."""
+    global _LOCAL_ZONE
+    if _LOCAL_ZONE is None:
+        candidates = [os.environ.get("TZ", "").lstrip(":")]
+        try:
+            target = os.path.realpath("/etc/localtime")
+            if "/zoneinfo/" in target:
+                candidates.append(target.split("/zoneinfo/", 1)[1])
+        except OSError:
+            pass
+        for name in candidates:
+            zone = zone_for(name) if name else None
+            if zone is not None:
+                _LOCAL_ZONE = zone
+                break
+        else:
+            _LOCAL_ZONE = datetime.now().astimezone().tzinfo
+    return _LOCAL_ZONE
 
 
 def parse_dt(value: str, params: dict) -> tuple[datetime | date | None, bool]:
@@ -922,18 +967,32 @@ def split_events(text: str) -> tuple[list[list[str]], bool]:
     events: list[list[str]] = []
     current: list[str] | None = None
     truncated = False
+    # Depth of components nested inside the current VEVENT. A VALARM carries
+    # its own SUMMARY ("Alarm notification"), DESCRIPTION ("This is an event
+    # reminder") and ATTENDEE lines; read as the event's, they replace its
+    # title and the description that holds the meeting link.
+    nested = 0
     for line in unfold(text):
         stripped = line.strip()
-        if stripped == "BEGIN:VEVENT":
+        upper = stripped.upper()
+        if upper == "BEGIN:VEVENT":
             if len(events) >= MAX_EVENTS_PER_DOCUMENT:
                 truncated = True
                 break
             current = []
-        elif stripped == "END:VEVENT":
+            nested = 0
+        elif upper == "END:VEVENT":
             if current is not None:
                 events.append(current)
             current = None
-        elif current is not None and len(current) < MAX_LINES_PER_EVENT:
+            nested = 0
+        elif current is None:
+            continue
+        elif upper.startswith("BEGIN:"):
+            nested += 1
+        elif upper.startswith("END:") and nested:
+            nested -= 1
+        elif nested == 0 and len(current) < MAX_LINES_PER_EVENT:
             current.append(line)
     return events, truncated
 
@@ -1030,7 +1089,9 @@ def parse_rrule(rule: str) -> dict:
     if not chunks or len(chunks) > MAX_RULE_TOKENS:
         raise ValueError("RRULE has too many fields")
     parsed: dict = {}
-    allowed = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH"}
+    # WKST only moves where a week starts; Google and Outlook add it to most
+    # weekly series, so refusing it silently dropped those whole series.
+    allowed = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "WKST"}
     for chunk in chunks:
         if "=" not in chunk:
             raise ValueError("RRULE field has no value")
@@ -1080,6 +1141,10 @@ def parse_rrule(rule: str) -> dict:
         raise ValueError("RRULE cannot contain both COUNT and UNTIL")
     parsed["_BYMONTH"] = integer_list("BYMONTH", 1, 12)
     parsed["_BYMONTHDAY"] = integer_list("BYMONTHDAY", -31, 31, reject_zero=True)
+    wkst = parsed.get("WKST", "MO")
+    if wkst not in WEEKDAYS:
+        raise ValueError("RRULE WKST is invalid")
+    parsed["_WKST"] = WEEKDAYS[wkst]
 
     bydays: list[tuple[int | None, str]] = []
     if parsed.get("BYDAY"):
@@ -1141,6 +1206,10 @@ def byday_matches(
     return False
 
 
+def _week_start(day: date, wkst: int) -> date:
+    return day - timedelta(days=(day.weekday() - wkst) % 7)
+
+
 def day_matches(day: date, rule: dict, seed: date) -> bool:
     freq = rule.get("FREQ", "")
     interval = rule["_INTERVAL"]
@@ -1164,8 +1233,9 @@ def day_matches(day: date, rule: dict, seed: date) -> bool:
         return byday_matches(day, bydays, freq) if bydays else True
 
     if freq == "WEEKLY":
-        seed_week = seed - timedelta(days=seed.weekday())
-        day_week = day - timedelta(days=day.weekday())
+        wkst = rule.get("_WKST", 0)
+        seed_week = _week_start(seed, wkst)
+        day_week = _week_start(day, wkst)
         if ((day_week - seed_week).days // 7) % interval:
             return False
         if bydays:
@@ -1206,6 +1276,7 @@ def _weekly_occurrences_before(
     interval: int,
     bydays: list[tuple[int | None, str]],
     exclusive: date,
+    wkst: int = 0,
 ) -> int:
     """Count a plain weekly rule before a date without walking every day.
 
@@ -1217,11 +1288,11 @@ def _weekly_occurrences_before(
     weekdays = {WEEKDAYS[name] for ordinal, name in bydays if ordinal is None}
     if not weekdays:
         weekdays = {seed_date.weekday()}
-    seed_week = seed_date - timedelta(days=seed_date.weekday())
+    seed_week = _week_start(seed_date, wkst)
     stride_days = 7 * interval
     total = 0
     for weekday in weekdays:
-        first = seed_week + timedelta(days=weekday)
+        first = seed_week + timedelta(days=(weekday - wkst) % 7)
         if first < seed_date:
             first += timedelta(days=stride_days)
         if first < exclusive:
@@ -1319,7 +1390,12 @@ def expand(event: dict, window_start: datetime, window_end: datetime) -> list[da
 
     excluded = set()
     for item in event["exdates"][:MAX_EXDATES_PER_EVENT]:
-        excluded.add(item if isinstance(item, date) and not isinstance(item, datetime) else item.date())
+        if isinstance(item, datetime):
+            # An EXDATE in UTC can fall on another calendar day than the
+            # occurrence it removes; compare in the series' own zone.
+            zone = None if is_date else start.tzinfo
+            item = item.astimezone(zone).date() if zone else item.date()
+        excluded.add(item)
 
     # COUNT is relative to the first occurrence, so it forces a walk from the
     # seed — day by day, that is O(days since DTSTART), which is fine for a
@@ -1345,7 +1421,7 @@ def expand(event: dict, window_start: datetime, window_end: datetime) -> list[da
     if count is not None and weekly_shape:
         cursor = max(seed_date, before)
         seen = _weekly_occurrences_before(
-            seed_date, interval, rule["_BYDAY"], cursor
+            seed_date, interval, rule["_BYDAY"], cursor, rule["_WKST"]
         )
         if seen >= count:
             return []
@@ -1400,6 +1476,7 @@ LINK_PATTERNS = [
     r"https://[a-z0-9.-]*zoom\.us/j/[^\s<>\"']+",
     r"https://[a-z0-9.-]*zoom\.us/my/[^\s<>\"']+",
     r"https://teams\.microsoft\.com/l/meetup-join/[^\s<>\"']+",
+    r"https://teams\.microsoft\.com/meet/[^\s<>\"']+",
     r"https://teams\.live\.com/meet/[^\s<>\"']+",
     r"https://[a-z0-9.-]*webex\.com/[^\s<>\"']+",
     r"https://[a-z0-9.-]*whereby\.com/[^\s<>\"']+",
@@ -1424,7 +1501,10 @@ def find_link(event: dict) -> str:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(0).rstrip(".,);")
-    for text in haystacks:
+    # No known meeting service. Only fields that exist to hold the event's
+    # own address are trusted as a link: the first URL of a description is as
+    # likely to be a mail signature's website as the meeting.
+    for text in (event.get("conference", ""), event.get("url", "")):
         match = re.search(r"https://[^\s<>\"']+", text or "")
         if match:
             return match.group(0).rstrip(".,);")
@@ -1439,7 +1519,6 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
     sources = cfg.get("calendars") or []
     warnings: list[str] = []
     events: list[dict] = []
-    overrides: dict[tuple[str, str], dict] = {}
     total_documents = 0
     total_bytes = 0
     # Shared across every remote source in this one call, so N slow calendars
@@ -1451,8 +1530,9 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
             str(source), int(cfg.get("refreshSeconds", 300)), force_refresh, deadline
         )
         warnings.extend(source_warnings)
-        label = Path(str(source)).name if not is_remote(str(source)) else "remote"
+        fallback = Path(str(source)).name if not is_remote(str(source)) else "remote"
         for document in documents:
+            label = calendar_name(document, fallback)
             document_bytes = len(document.encode("utf-8"))
             if total_documents >= MAX_TOTAL_DOCUMENTS:
                 warnings.append(
@@ -1484,12 +1564,48 @@ def collect(cfg: dict, force_refresh: bool = False) -> tuple[list[dict], list[st
                     continue
                 if event is None:
                     continue
-                if event["recurrence_id"] is not None:
-                    key = (event["uid"], str(event["recurrence_id"]))
-                    overrides[key] = event
                 events.append(event)
 
     return events, _bounded_warnings(warnings)
+
+
+def calendar_name(document: str, fallback: str) -> str:
+    """The calendar's own name (X-WR-CALNAME), shown on the alert."""
+    match = re.search(r"^X-WR-CALNAME[^:\r\n]*:([^\r\n]*)", document[:65_536], re.MULTILINE)
+    name = unescape(match.group(1)).strip() if match else ""
+    return (name or fallback)[:64]
+
+
+def self_addresses(cfg: dict) -> set[str]:
+    """selfEmails, plus the owner of every Google calendar address: Google's
+    secret iCal URL names its calendar, /calendar/ical/<address>/private-…,
+    so declines are recognised without asking for it twice."""
+    mine = {str(a).strip().lower() for a in cfg.get("selfEmails", [])}
+    for source in cfg.get("calendars", []):
+        if not is_remote(str(source)):
+            continue
+        parsed = urlsplit(normalize_url(str(source)))
+        if (parsed.hostname or "").lower() != "calendar.google.com":
+            continue
+        parts = parsed.path.split("/")
+        if "ical" in parts:
+            index = parts.index("ical")
+            if index + 1 < len(parts):
+                candidate = unquote(parts[index + 1]).strip().lower()
+                if "@" in candidate and len(candidate) <= MAX_EMAIL_CHARS:
+                    mine.add(candidate)
+    return mine
+
+
+def occurrence_key(value) -> int | None:
+    """One instant for a RECURRENCE-ID or an expanded start, whatever zone
+    either was written in: Google can write the override in UTC and the
+    series in its TZID, and their string forms then never match."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        value = datetime.combine(value, dtime(0, 0), tzinfo=local_zone())
+    return int(value.timestamp())
 
 
 class _RegexTimedOut(Exception):
@@ -1535,8 +1651,17 @@ def wanted(event: dict, cfg: dict) -> bool:
         return False
     if cfg.get("ignoreAllDay", True) and event.get("all_day"):
         return False
+    max_hours = int(cfg.get("maxMeetingHours", 12) or 0)
+    if max_hours and not event.get("all_day"):
+        try:
+            if event["end"] - event["start"] > timedelta(hours=max_hours):
+                # A holiday, a trip, "school holidays, for information":
+                # not a meeting, and not something to take the screen for.
+                return False
+        except (KeyError, OverflowError, TypeError):
+            pass
     if cfg.get("skipDeclined", True):
-        mine = {str(a).lower() for a in cfg.get("selfEmails", [])}
+        mine = cfg.get("_self") if "_self" in cfg else self_addresses(cfg)
         declined = {
             address.replace("mailto:", "") for address in event.get("declined_addresses", [])
         }
@@ -1553,10 +1678,12 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
     window_start = now - timedelta(minutes=5)
     window_end = now + horizon
 
-    overridden: set[tuple[str, str]] = set()
+    overridden: set[tuple[str, int]] = set()
     for event in events:
         if event["recurrence_id"] is not None:
-            overridden.add((event["uid"], str(event["recurrence_id"])))
+            overridden.add((event["uid"], occurrence_key(event["recurrence_id"])))
+    cfg = dict(cfg)
+    cfg["_self"] = self_addresses(cfg)
 
     out = []
     out_bytes = 2  # JSON list brackets
@@ -1579,7 +1706,8 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
             )
         except (OverflowError, TypeError):
             continue
-        if length <= timedelta(0):
+        # Zero is a reminder (start = end), and still worth the alert.
+        if length < timedelta(0):
             continue
         # The alert path only needs a short grace period, but the bar also
         # needs occurrences that started earlier and have not ended yet. Keep
@@ -1600,7 +1728,7 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
                 )
                 out.sort(key=lambda item: item["start"])
                 return out, _bounded_warnings(warnings)
-            if event["recurrence_id"] is None and (event["uid"], str(start)) in overridden:
+            if event["recurrence_id"] is None and (event["uid"], occurrence_key(start)) in overridden:
                 continue
             link = find_link(event)
             if cfg.get("onlyWithLink") and not link:
@@ -1794,9 +1922,11 @@ def config_fingerprint(cfg: dict) -> str:
         key: cfg.get(key)
         for key in (
             "calendars", "ignoreAllDay", "skipCancelled", "skipDeclined",
-            "selfEmails", "ignoreTitles", "onlyWithLink",
+            "selfEmails", "ignoreTitles", "onlyWithLink", "maxMeetingHours",
         )
     }
+    # Bumped whenever parsing changes what the same calendar expands to.
+    relevant["_reader"] = 2
     blob = json.dumps(relevant, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -1919,20 +2049,30 @@ def cmd_check(args) -> int:
     lead = max(0, min(86_400, lead))
     items, warnings, from_cache = cached_occurrences(cfg, now)
 
-    upcoming = []
+    grace = int(cfg.get("graceSeconds", 120))
+    # Everything due within the lead window or still under way. The service
+    # takes the first one it has not handled yet: answering with a single
+    # event meant that dismissing it hid a second meeting at the same time,
+    # and a snooze that ran past the start could never come back.
+    candidates = []
     for item in items:
         starts_in = int(float(item["start"]) - now.timestamp())
-        if -60 <= starts_in <= lead:
+        ends_in = int(float(item["end"]) - now.timestamp())
+        if starts_in <= lead and (ends_in > 0 or starts_in >= -grace):
             fresh = dict(item)
             fresh["startsIn"] = starts_in
-            upcoming.append(fresh)
-    upcoming.sort(key=lambda entry: entry["start"])
+            candidates.append(fresh)
+    candidates.sort(key=lambda entry: entry["start"])
+    candidates = candidates[-MAX_CHECK_CANDIDATES:]
+    fresh_ones = [entry for entry in candidates if entry["startsIn"] >= -grace]
 
     payload = {
         "now": int(now.timestamp()),
         "leadSeconds": lead,
+        "graceSeconds": grace,
         "cached": from_cache,
-        "event": upcoming[0] if upcoming else None,
+        "event": fresh_ones[0] if fresh_ones else None,
+        "candidates": candidates,
         "warnings": warnings,
     }
     json.dump(payload, sys.stdout, ensure_ascii=False)

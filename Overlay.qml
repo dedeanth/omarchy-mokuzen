@@ -202,7 +202,10 @@ Item {
           visible: !!root.event
           text: {
             if (!root.event) return ""
-            var span = root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
+            // A reminder (start = end) has a time, not a span.
+            var span = Number(root.event.end) > Number(root.event.start)
+              ? root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
+              : root.clockOf(root.event.start)
             return root.calendarName ? span + "  ·  " + root.calendarName : span
           }
           // calendarName is the calendar's own X-WR-CALNAME, also untrusted.

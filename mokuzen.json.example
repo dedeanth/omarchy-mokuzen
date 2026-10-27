@@ -17,6 +17,7 @@
   "selfEmails": ["you@example.com"],
   "ignoreTitles": ["^Focus time", "lunch"],
   "onlyWithLink": false,
+  "maxMeetingHours": 12,
 
   "enabled": true
 }

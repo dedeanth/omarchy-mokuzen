@@ -67,7 +67,8 @@ BarWidget {
     var minutes = Math.round(seconds / 60)
     if (minutes < 60) return minutes + "m"
     var hours = Math.floor(minutes / 60)
-    return hours + "h" + (minutes % 60 > 0 ? String(minutes % 60) : "")
+    var rest = minutes % 60
+    return hours + "h" + (rest > 0 ? (rest < 10 ? "0" : "") + rest : "")
   }
 
   function barLabel() {

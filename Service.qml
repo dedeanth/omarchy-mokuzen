@@ -57,20 +57,31 @@ Item {
   property var suppressed: ({})
   readonly property int maxSuppressed: 256
 
+  // occurrenceId -> epoch seconds of the meeting's end. A snoozed meeting
+  // comes back when its snooze runs out even if that is after graceSeconds,
+  // for as long as it is still under way.
+  property var snoozed: ({})
+
   PersistentProperties {
     id: persisted
     reloadableId: "mokuzen-service"
     property string suppressedJson: "{}"
+    property string snoozedJson: "{}"
+  }
+
+  function restoreMap(saved) {
+    try {
+      var text = String(saved || "")
+      var restored = text.length <= 262144 ? JSON.parse(text) : ({})
+      return (restored && typeof restored === "object") ? restored : ({})
+    } catch (e) {
+      return ({})
+    }
   }
 
   Component.onCompleted: {
-    try {
-      var saved = String(persisted.suppressedJson || "")
-      var restored = saved.length <= 262144 ? JSON.parse(saved) : ({})
-      if (restored && typeof restored === "object") root.suppressed = restored
-    } catch (e) {
-      root.suppressed = ({})
-    }
+    root.suppressed = restoreMap(persisted.suppressedJson)
+    root.snoozed = restoreMap(persisted.snoozedJson)
     prune()
   }
 
@@ -80,11 +91,11 @@ Item {
 
   // Suppressions are worthless once their meeting is long past; dropping them
   // keeps the persisted blob from growing for the life of the session.
-  function prune() {
+  function pruneMap(map) {
     var now = nowSeconds()
     var rows = []
-    for (var id in root.suppressed) {
-      var until = Number(root.suppressed[id])
+    for (var id in map) {
+      var until = Number(map[id])
       if (Number.isFinite(until) && until > now) rows.push({ id: id, until: until })
     }
     rows.sort(function(a, b) { return b.until - a.until })
@@ -92,8 +103,14 @@ Item {
     for (var i = 0; i < Math.min(rows.length, root.maxSuppressed); i++) {
       next[rows[i].id] = rows[i].until
     }
-    root.suppressed = next
-    persisted.suppressedJson = JSON.stringify(next)
+    return next
+  }
+
+  function prune() {
+    root.suppressed = pruneMap(root.suppressed)
+    root.snoozed = pruneMap(root.snoozed)
+    persisted.suppressedJson = JSON.stringify(root.suppressed)
+    persisted.snoozedJson = JSON.stringify(root.snoozed)
   }
 
   function suppress(occurrenceId, untilSeconds) {
@@ -134,13 +151,30 @@ Item {
     // Silence it until well past the end, so a long meeting cannot re-alert.
     var until = event && event.end ? Number(event.end) + 3600 : nowSeconds() + 3600
     suppress(id, until)
+    forgetSnooze(id)
     root.currentEvent = null
     hideOverlay()
+  }
+
+  function forgetSnooze(occurrenceId) {
+    if (!occurrenceId || root.snoozed[occurrenceId] === undefined) return
+    var next = ({})
+    for (var id in root.snoozed) if (id !== occurrenceId) next[id] = root.snoozed[id]
+    root.snoozed = next
+    persisted.snoozedJson = JSON.stringify(next)
   }
 
   function snooze(occurrenceId, seconds) {
     var id = occurrenceId || (root.currentEvent ? root.currentEvent.occurrenceId : "")
     var delay = Math.max(30, Number(seconds) || root.snoozeSeconds)
+    var event = root.currentEvent
+    if (id) {
+      var next = ({})
+      for (var key in root.snoozed) next[key] = root.snoozed[key]
+      var end = event && event.end ? Number(event.end) : nowSeconds() + delay + 3600
+      next[String(id).slice(0, 768)] = Math.min(Math.max(end, nowSeconds() + delay + 60), nowSeconds() + 604800)
+      root.snoozed = next
+    }
     suppress(id, nowSeconds() + delay)
     root.currentEvent = null
     hideOverlay()
@@ -163,23 +197,36 @@ Item {
     }
     root.lastWarning = (payload.warnings && payload.warnings.length) ? String(payload.warnings[0]) : ""
 
-    var event = payload.event
-    if (!event || !event.occurrenceId) return
-    if (root.isSuppressed(event.occurrenceId)) return
+    // Every occurrence due or under way, earliest first; older readers only
+    // sent `event`. Take the first one not handled yet, so dismissing one of
+    // two simultaneous meetings does not hide the other.
+    var candidates = Array.isArray(payload.candidates) ? payload.candidates
+      : (payload.event ? [payload.event] : [])
+    var open = root.currentEvent && root.shell && typeof root.shell.isPluginOpen === "function"
+      && root.shell.isPluginOpen(root.pluginId)
 
-    // Already on screen for this very occurrence: leave it alone rather than
-    // re-summoning every poll.
-    if (root.currentEvent && root.currentEvent.occurrenceId === event.occurrenceId
-      && root.shell && typeof root.shell.isPluginOpen === "function"
-      && root.shell.isPluginOpen(root.pluginId)) {
-      root.currentEvent = event
+    for (var i = 0; i < candidates.length; i++) {
+      var event = candidates[i]
+      if (!event || !event.occurrenceId) continue
+
+      // Already on screen for this very occurrence: leave it alone rather
+      // than re-summoning every poll.
+      if (open && root.currentEvent.occurrenceId === event.occurrenceId) {
+        root.currentEvent = event
+        return
+      }
+      if (root.isSuppressed(event.occurrenceId)) continue
+
+      // A meeting that started a while ago is not news any more — unless it
+      // was snoozed, in which case this is exactly the moment asked for.
+      var wasSnoozed = root.snoozed[event.occurrenceId] !== undefined
+      if (Number(event.startsIn) < -root.graceSeconds && !wasSnoozed) continue
+
+      // Something is already up: do not replace it with another meeting.
+      if (open) return
+      root.raise(event)
       return
     }
-
-    // A meeting that started a while ago is not news any more.
-    if (Number(event.startsIn) < -root.graceSeconds) return
-
-    root.raise(event)
   }
 
   // ---- what the bar widget needs -----------------------------------------
