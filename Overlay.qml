@@ -1,12 +1,15 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 
-// The thing you cannot miss. A layer-shell surface on the overlay layer,
-// covering the screen, holding keyboard focus while it is up.
+// The thing you cannot miss. A layer-shell surface on the overlay layer on
+// every screen — a meeting is just as easy to miss on the monitor you are not
+// looking at. The screen that had focus when it opened holds the keyboard; the
+// buttons work on all of them.
 //
 // omarchy-shell drives the lifecycle: summon() calls open(payload), hide()
 // calls close(), and `opened` is what the shell reads back. The event itself
@@ -30,6 +33,8 @@ Item {
   property bool acceptsKeys: false
 
   property var event: null
+  // Name of the screen that takes the keyboard, chosen when the alert opens.
+  property string keyboardScreen: ""
   property int nowSeconds: Math.floor(Date.now() / 1000)
 
   readonly property int startsIn: event && event.start ? Number(event.start) - nowSeconds : 0
@@ -52,10 +57,27 @@ Item {
     // The service is the source of truth when it has something to say.
     if (root.service && root.service.currentEvent) incoming = root.service.currentEvent
     if (incoming) root.event = incoming
+    root.keyboardScreen = focusedScreenName()
     root.nowSeconds = Math.floor(Date.now() / 1000)
     root.acceptsKeys = false
     inputGuard.restart()
     root.opened = true
+  }
+
+  readonly property bool keyboardScreenPresent: {
+    for (var i = 0; i < Quickshell.screens.length; i++) {
+      if (String(Quickshell.screens[i].name) === root.keyboardScreen) return true
+    }
+    return false
+  }
+
+  function focusedScreenName() {
+    var monitor = Hyprland.focusedMonitor
+    var name = monitor ? String(monitor.name || "") : ""
+    for (var i = 0; i < Quickshell.screens.length; i++) {
+      if (Quickshell.screens[i].name === name) return name
+    }
+    return Quickshell.screens.length > 0 ? String(Quickshell.screens[0].name) : ""
   }
 
   function close() {
@@ -121,186 +143,198 @@ Item {
     }
   }
 
-  PanelWindow {
-    id: window
+  Variants {
+    model: Quickshell.screens
 
-    visible: root.opened
-    anchors { top: true; bottom: true; left: true; right: true }
-    color: "transparent"
-    WlrLayershell.namespace: "mokuzen"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
-    exclusionMode: ExclusionMode.Ignore
+    PanelWindow {
+      id: window
 
-    // Fully opaque on purpose. This is the one surface that is allowed to
-    // interrupt, and a translucent one lets the desktop behind it keep
-    // competing for attention — the theme's background may also carry its own
-    // alpha, so the channels are taken and the opacity is pinned.
-    Rectangle {
-      anchors.fill: parent
-      color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 1.0)
-    }
+      required property var modelData
+      // Only one surface can hold exclusive focus; two would fight over it.
+      // If that screen went away, the first remaining one takes over.
+      readonly property bool takesKeyboard: String(modelData.name) === root.keyboardScreen
+        || (!root.keyboardScreenPresent && Quickshell.screens.length > 0
+          && Quickshell.screens[0] === modelData)
 
-    FocusScope {
-      id: scope
-      anchors.fill: parent
-      focus: root.opened
+      screen: modelData
+      visible: root.opened
+      anchors { top: true; bottom: true; left: true; right: true }
+      color: "transparent"
+      WlrLayershell.namespace: "mokuzen"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: root.opened && takesKeyboard ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+      exclusionMode: ExclusionMode.Ignore
 
-      onActiveFocusChanged: if (root.opened && !activeFocus) forceActiveFocus()
-
-      Keys.onPressed: function(keyEvent) {
-        if (!root.acceptsKeys) {
-          keyEvent.accepted = true
-          return
-        }
-        switch (keyEvent.key) {
-        case Qt.Key_Escape:
-          root.dismiss(); keyEvent.accepted = true; break
-        case Qt.Key_Return:
-        case Qt.Key_Enter:
-          if (root.link) root.join(); else root.dismiss()
-          keyEvent.accepted = true; break
-        case Qt.Key_S:
-          root.snooze(); keyEvent.accepted = true; break
-        default:
-          break
-        }
+      // Fully opaque on purpose. This is the one surface that is allowed to
+      // interrupt, and a translucent one lets the desktop behind it keep
+      // competing for attention — the theme's background may also carry its own
+      // alpha, so the channels are taken and the opacity is pinned.
+      Rectangle {
+        anchors.fill: parent
+        color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 1.0)
       }
 
-      ColumnLayout {
-        anchors.centerIn: parent
-        width: Math.min(parent.width - Style.space(96), Style.space(880))
-        spacing: Style.space(12)
+      FocusScope {
+        id: scope
+        anchors.fill: parent
+        focus: root.opened && window.takesKeyboard
 
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          text: root.countdownText()
-          color: root.startsIn <= 0 ? Color.urgent : Color.accent
-          font.family: Style.font.family
-          font.pixelSize: root.countdownSize
-          font.weight: Font.Bold
-        }
+        onActiveFocusChanged: if (root.opened && window.takesKeyboard && !activeFocus) forceActiveFocus()
 
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          Layout.fillWidth: true
-          text: root.summary
-          // The event title comes straight from a calendar we do not
-          // control; AutoText would let it be interpreted as rich text.
-          textFormat: Text.PlainText
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: root.titleSize
-          horizontalAlignment: Text.AlignHCenter
-          wrapMode: Text.WordWrap
-          maximumLineCount: 3
-          elide: Text.ElideRight
-        }
-
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          visible: !!root.event
-          text: {
-            if (!root.event) return ""
-            // A reminder (start = end) has a time, not a span.
-            var span = Number(root.event.end) > Number(root.event.start)
-              ? root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
-              : root.clockOf(root.event.start)
-            return root.calendarName ? span + "  ·  " + root.calendarName : span
+        Keys.onPressed: function(keyEvent) {
+          if (!root.acceptsKeys) {
+            keyEvent.accepted = true
+            return
           }
-          // calendarName is the calendar's own X-WR-CALNAME, also untrusted.
-          textFormat: Text.PlainText
-          color: Color.muted
-          font.family: Style.font.family
-          font.pixelSize: root.detailSize
+          switch (keyEvent.key) {
+          case Qt.Key_Escape:
+            root.dismiss(); keyEvent.accepted = true; break
+          case Qt.Key_Return:
+          case Qt.Key_Enter:
+            if (root.link) root.join(); else root.dismiss()
+            keyEvent.accepted = true; break
+          case Qt.Key_S:
+            root.snooze(); keyEvent.accepted = true; break
+          default:
+            break
+          }
         }
 
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          Layout.fillWidth: true
-          visible: text !== ""
-          text: root.link ? root.linkLabel() : root.location
-          // Both the link host and the free-text location are calendar-
-          // controlled.
-          textFormat: Text.PlainText
-          color: Color.muted
-          font.family: Style.font.family
-          font.pixelSize: Style.font.subtitle
-          horizontalAlignment: Text.AlignHCenter
-          elide: Text.ElideMiddle
-        }
-
-        RowLayout {
-          Layout.alignment: Qt.AlignHCenter
-          Layout.topMargin: Style.space(20)
+        ColumnLayout {
+          anchors.centerIn: parent
+          width: Math.min(parent.width - Style.space(96), Style.space(880))
           spacing: Style.space(12)
 
-          Repeater {
-            model: [
-              { label: root.link ? "Join" : "Got it", hint: "Enter", primary: true, action: "join" },
-              { label: "Snooze", hint: "S", primary: false, action: "snooze" },
-              { label: "Dismiss", hint: "Esc", primary: false, action: "dismiss" }
-            ]
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            text: root.countdownText()
+            color: root.startsIn <= 0 ? Color.urgent : Color.accent
+            font.family: Style.font.family
+            font.pixelSize: root.countdownSize
+            font.weight: Font.Bold
+          }
 
-            delegate: Rectangle {
-              required property var modelData
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.fillWidth: true
+            text: root.summary
+            // The event title comes straight from a calendar we do not
+            // control; AutoText would let it be interpreted as rich text.
+            textFormat: Text.PlainText
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: root.titleSize
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            maximumLineCount: 3
+            elide: Text.ElideRight
+          }
 
-              implicitWidth: buttonRow.implicitWidth + Style.space(32)
-              implicitHeight: buttonRow.implicitHeight + Style.space(18)
-              radius: Style.cornerRadius
-              color: modelData.primary ? Color.accent : "transparent"
-              border.width: modelData.primary ? 0 : 1
-              border.color: Color.muted
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            visible: !!root.event
+            text: {
+              if (!root.event) return ""
+              // A reminder (start = end) has a time, not a span.
+              var span = Number(root.event.end) > Number(root.event.start)
+                ? root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
+                : root.clockOf(root.event.start)
+              return root.calendarName ? span + "  ·  " + root.calendarName : span
+            }
+            // calendarName is the calendar's own X-WR-CALNAME, also untrusted.
+            textFormat: Text.PlainText
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: root.detailSize
+          }
 
-              RowLayout {
-                id: buttonRow
-                anchors.centerIn: parent
-                spacing: Style.space(10)
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.fillWidth: true
+            visible: text !== ""
+            text: root.link ? root.linkLabel() : root.location
+            // Both the link host and the free-text location are calendar-
+            // controlled.
+            textFormat: Text.PlainText
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.subtitle
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideMiddle
+          }
 
-                Text {
-                  text: modelData.label
-                  color: modelData.primary ? Color.background : Color.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.title
+          RowLayout {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(20)
+            spacing: Style.space(12)
+
+            Repeater {
+              model: [
+                { label: root.link ? "Join" : "Got it", hint: "Enter", primary: true, action: "join" },
+                { label: "Snooze", hint: "S", primary: false, action: "snooze" },
+                { label: "Dismiss", hint: "Esc", primary: false, action: "dismiss" }
+              ]
+
+              delegate: Rectangle {
+                required property var modelData
+
+                implicitWidth: buttonRow.implicitWidth + Style.space(32)
+                implicitHeight: buttonRow.implicitHeight + Style.space(18)
+                radius: Style.cornerRadius
+                color: modelData.primary ? Color.accent : "transparent"
+                border.width: modelData.primary ? 0 : 1
+                border.color: Color.muted
+
+                RowLayout {
+                  id: buttonRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(10)
+
+                  Text {
+                    text: modelData.label
+                    color: modelData.primary ? Color.background : Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.title
+                  }
+
+                  Text {
+                    text: modelData.hint
+                    color: modelData.primary ? Color.background : Color.muted
+                    opacity: 0.7
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
                 }
 
-                Text {
-                  text: modelData.hint
-                  color: modelData.primary ? Color.background : Color.muted
-                  opacity: 0.7
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (modelData.action === "join") {
-                    if (root.link) root.join(); else root.dismiss()
-                  } else if (modelData.action === "snooze") {
-                    root.snooze()
-                  } else {
-                    root.dismiss()
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (modelData.action === "join") {
+                      if (root.link) root.join(); else root.dismiss()
+                    } else if (modelData.action === "snooze") {
+                      root.snooze()
+                    } else {
+                      root.dismiss()
+                    }
                   }
                 }
               }
             }
           }
-        }
 
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          Layout.topMargin: Style.space(8)
-          visible: !!root.service && root.service.lastWarning !== ""
-          text: root.service ? root.service.lastWarning : ""
-          // Warnings can echo a fetch error, which can echo calendar-server
-          // content; never let it be interpreted as rich text.
-          textFormat: Text.PlainText
-          color: Color.urgent
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(8)
+            visible: !!root.service && root.service.lastWarning !== ""
+            text: root.service ? root.service.lastWarning : ""
+            // Warnings can echo a fetch error, which can echo calendar-server
+            // content; never let it be interpreted as rich text.
+            textFormat: Text.PlainText
+            color: Color.urgent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
         }
       }
     }

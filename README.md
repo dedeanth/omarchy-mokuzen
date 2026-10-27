@@ -176,7 +176,8 @@ Mokuzen writes nothing outside those two paths.
 
 Three entry points of one plugin, all inside the long-lived `omarchy-shell`
 process. `Service.qml` asks `bin/mokuzen-agenda` what's about to start and
-summons the alert. `Overlay.qml` is the fullscreen layer-shell surface.
+summons the alert. `Overlay.qml` is the fullscreen layer-shell surface, on every screen; the one
+that had focus takes the keyboard.
 `BarWidget.qml` is the bar entry and its panel. The shell hands the service to
 the other two, so they share state in memory — no files passed between halves,
 nothing about your calendar on disk beyond the `.ics` cache, which is
