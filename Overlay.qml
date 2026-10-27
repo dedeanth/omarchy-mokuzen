@@ -105,17 +105,23 @@ Item {
     return Qt.formatDateTime(new Date(Number(epoch) * 1000), "HH:mm")
   }
 
+  // Past an hour, hours and minutes — "1h15", as in the bar — never "75 min".
+  function hoursMinutes(minutes) {
+    var rest = minutes % 60
+    return Math.floor(minutes / 60) + "h" + (rest < 10 ? "0" : "") + rest
+  }
+
   function countdownText() {
     var left = root.startsIn
     if (left <= 0 && left > -60) return "starting now"
-    if (left <= -60) return "started " + Math.round(-left / 60) + " min ago"
+    if (left <= -60) {
+      var ago = Math.round(-left / 60)
+      return "started " + (ago >= 60 ? hoursMinutes(ago) : ago + " min") + " ago"
+    }
     if (left < 60) return left + "s"
     var minutes = Math.floor(left / 60)
     var seconds = left % 60
-    if (minutes >= 60) {
-      var hours = Math.floor(minutes / 60)
-      return hours + "h " + (minutes % 60) + "m"
-    }
+    if (minutes >= 60) return hoursMinutes(minutes)
     return minutes + ":" + (seconds < 10 ? "0" : "") + seconds
   }
 
