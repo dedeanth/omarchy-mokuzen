@@ -11,7 +11,7 @@ screen: what's starting, how long you have, and one key to join. Then it gets
 out of the way.
 
 <p align="center">
-  <img src="preview.png" width="720" alt="The Mokuzen alert: a countdown, the meeting title, its time, and Join / Snooze / Dismiss">
+  <img src="preview.png" width="720" alt="The Mokuzen alert: the meeting title, its time, how long until it starts, Join, Close and the snooze choices, over the blurred wallpaper">
 </p>
 
 - **It reads your calendar. That's it.** Google, Outlook, iCloud, Nextcloud,
@@ -102,6 +102,7 @@ empty.
 | `ignoreTitles` | `[]` | Regular expressions; a matching title never alerts. Good for recurring reminders that aren't meetings. |
 | `onlyWithLink` | `false` | Only alert for events that carry a meeting link. |
 | `maxMeetingHours` | `12` | Timed events longer than this — holidays, trips, "for information" blocks — never alert. `0` disables the limit. |
+| `language` | `""` | Language of the alert and the panel: `""` follows Setup > Language, or force one (`"fr"`, `"en"`). Catalogs live in `i18n/`. |
 | `enabled` | `true` | Keep the plugin installed but silent. |
 
 Two more live on the bar entry, because they're about the bar and not your
@@ -115,6 +116,12 @@ omarchy bar set io.github.dedeanth.mokuzen hideWhenEmpty false --json
 </details>
 
 ## When it fires
+
+The alert sits on your blurred wallpaper, on every screen: the title, its
+time, how long until it starts, buttons for the event's notes and for its day
+in Google Calendar, **Join** (the chevron beside it copies the link),
+**Close**, and a row of snooze choices — the snooze delay, five minutes, and
+*when it starts*, with more behind `⋯`.
 
 | Key | Action |
 | --- | --- |

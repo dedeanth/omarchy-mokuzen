@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 
 // Mokuzen's clock. It asks bin/mokuzen-agenda what is about to start, and
 // when something is, it summons the overlay entry point of this same plugin.
@@ -34,6 +35,60 @@ Item {
   readonly property int autoDismissSeconds: Math.max(0, Number(config.autoDismissSeconds) || 0)
   readonly property int graceSeconds: Math.max(0, Number(config.graceSeconds) || 120)
   readonly property bool hasCalendars: Array.isArray(config.calendars) && config.calendars.length > 0
+
+  // ---- language ------------------------------------------------------------
+  //
+  // Catalogs in i18n/<code>.json, English underneath. `language` in
+  // mokuzen.json forces one; empty follows Setup > Language like the shell.
+  readonly property string language: String(config.language || I18n.language || "en")
+  property var englishStrings: ({})
+  property var languageStrings: ({})
+
+  function parseCatalog(raw) {
+    try {
+      var parsed = JSON.parse(raw || "{}")
+      return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : ({})
+    } catch (e) {
+      return ({})
+    }
+  }
+
+  FileView {
+    path: root.pluginDir + "i18n/en.json"
+    printErrors: false
+    blockLoading: true
+    onLoaded: root.englishStrings = root.parseCatalog(text())
+  }
+
+  FileView {
+    path: root.language !== "en" ? root.pluginDir + "i18n/" + root.language.split("-")[0] + ".json" : ""
+    printErrors: false
+    blockLoading: true
+    onLoaded: root.languageStrings = root.parseCatalog(text())
+    onLoadFailed: root.languageStrings = ({})
+    onPathChanged: if (path === "") root.languageStrings = ({})
+  }
+
+  // A string, or {"one": …, "other": …} picked by count.
+  function t(key, count) {
+    var layers = [root.languageStrings, root.englishStrings]
+    for (var i = 0; i < layers.length; i++) {
+      var value = layers[i][key]
+      if (value && typeof value === "object") value = (count === 1 && value.one) ? value.one : value.other
+      if (typeof value === "string" && value.length > 0) return value
+    }
+    return key
+  }
+
+  // Past an hour, hours and minutes — "1h05" — never "75 minutes".
+  function duration(seconds) {
+    seconds = Math.max(0, Math.round(seconds))
+    if (seconds < 60) return t("duration.seconds", seconds).arg(seconds)
+    var minutes = Math.round(seconds / 60)
+    if (minutes < 60) return t("duration.minutes", minutes).arg(minutes)
+    var rest = minutes % 60
+    return Math.floor(minutes / 60) + "h" + (rest < 10 ? "0" : "") + rest
+  }
 
   // ---- state -------------------------------------------------------------
 

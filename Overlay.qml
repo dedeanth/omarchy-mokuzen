@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Hyprland
@@ -10,6 +11,10 @@ import qs.Commons
 // every screen — a meeting is just as easy to miss on the monitor you are not
 // looking at. The screen that had focus when it opened holds the keyboard; the
 // buttons work on all of them.
+//
+// The look: the wallpaper, blurred and dimmed, under a centred column — title,
+// time span, how long until it starts, the notes and calendar buttons, Join
+// and Close, then the snooze choices. The clock sits top right.
 //
 // omarchy-shell drives the lifecycle: summon() calls open(payload), hide()
 // calls close(), and `opened` is what the shell reads back. The event itself
@@ -37,17 +42,46 @@ Item {
   property string keyboardScreen: ""
   property int nowSeconds: Math.floor(Date.now() / 1000)
 
+  // Shared by every screen, so opening the notes on one opens them on all.
+  property bool showNotes: false
+  property bool showLinkMenu: false
+  property bool showMoreSnooze: false
+
   readonly property int startsIn: event && event.start ? Number(event.start) - nowSeconds : 0
   readonly property string summary: event && event.summary ? String(event.summary) : ""
   readonly property string link: event && event.link ? String(event.link) : ""
   readonly property string location: event && event.location ? String(event.location) : ""
+  readonly property string notes: event && event.notes ? String(event.notes) : ""
+  readonly property string calendarUrl: event && event.calendarUrl ? String(event.calendarUrl) : ""
   readonly property string calendarName: event && event.calendar ? String(event.calendar) : ""
 
-  // A fullscreen alert wants more presence than a bar popup, but the theme
-  // still sets the scale: these are the shell's own tokens, multiplied.
-  readonly property int countdownSize: Math.round(Style.font.displayLarge * 2.6)
-  readonly property int titleSize: Math.round(Style.font.displayLarge * 1.5)
-  readonly property int detailSize: Math.round(Style.font.title * 1.1)
+  readonly property string wallpaperPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
+    + "/omarchy/current/background"
+
+  // The theme sets the scale; these are its tokens, multiplied.
+  readonly property int titleSize: Math.round(Style.font.displayLarge * 1.3)
+  readonly property int spanSize: Math.round(Style.font.displayLarge * 0.85)
+  readonly property int statusSize: Style.font.title
+  readonly property int buttonSize: Style.font.title
+  readonly property int radius: Math.max(Style.cornerRadius, Style.space(7))
+  readonly property int actionWidth: Style.space(210)
+  // Titles and labels read better in the desktop's sans-serif; the Nerd Font
+  // stays for the glyphs.
+  readonly property string textFamily: "sans-serif"
+  readonly property string glyphFamily: Style.font.family
+
+  readonly property color ink: Color.foreground
+  readonly property color line: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.75)
+  readonly property color quiet: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.7)
+
+  function tr(key, count) {
+    return root.service ? root.service.t(key, count) : key
+  }
+
+  function duration(seconds) {
+    if (root.service) return root.service.duration(seconds)
+    return Math.round(seconds / 60) + " min"
+  }
 
   function open(payload) {
     var incoming = null
@@ -59,6 +93,9 @@ Item {
     if (incoming) root.event = incoming
     root.keyboardScreen = focusedScreenName()
     root.nowSeconds = Math.floor(Date.now() / 1000)
+    root.showNotes = false
+    root.showLinkMenu = false
+    root.showMoreSnooze = false
     root.acceptsKeys = false
     inputGuard.restart()
     root.opened = true
@@ -91,8 +128,9 @@ Item {
     else root.close()
   }
 
-  function snooze() {
-    if (root.service) root.service.snooze(root.event ? root.event.occurrenceId : "", 0)
+  // seconds: 0 means the configured snooze delay.
+  function snooze(seconds) {
+    if (root.service) root.service.snooze(root.event ? root.event.occurrenceId : "", seconds || 0)
     else root.close()
   }
 
@@ -101,34 +139,48 @@ Item {
     else root.close()
   }
 
+  function copyLink() {
+    if (root.link) Quickshell.execDetached(["wl-copy", "--", root.link])
+    root.showLinkMenu = false
+  }
+
+  function openCalendar() {
+    if (root.calendarUrl) Quickshell.execDetached(["xdg-open", root.calendarUrl])
+  }
+
   function clockOf(epoch) {
     return Qt.formatDateTime(new Date(Number(epoch) * 1000), "HH:mm")
   }
 
-  // Past an hour, hours and minutes — "1h15", as in the bar — never "75 min".
-  function hoursMinutes(minutes) {
-    var rest = minutes % 60
-    return Math.floor(minutes / 60) + "h" + (rest < 10 ? "0" : "") + rest
-  }
-
-  function countdownText() {
+  function statusText() {
     var left = root.startsIn
-    if (left <= 0 && left > -60) return "starting now"
-    if (left <= -60) {
-      var ago = Math.round(-left / 60)
-      return "started " + (ago >= 60 ? hoursMinutes(ago) : ago + " min") + " ago"
-    }
-    if (left < 60) return left + "s"
-    var minutes = Math.floor(left / 60)
-    var seconds = left % 60
-    if (minutes >= 60) return hoursMinutes(minutes)
-    return minutes + ":" + (seconds < 10 ? "0" : "") + seconds
+    if (left > 0) return tr("alert.startsIn").arg(duration(left))
+    if (left > -60) return tr("alert.startingNow")
+    return tr("alert.startedAgo").arg(duration(-left))
   }
 
   function linkLabel() {
-    if (!root.link) return ""
     var match = String(root.link).match(/^https?:\/\/([^\/]+)/)
     return match ? match[1] : root.link
+  }
+
+  readonly property int configuredSnooze: root.service ? Number(root.service.snoozeSeconds) || 60 : 60
+
+  // The snooze row: the configured delay and five minutes, then "when it
+  // starts" while that is still ahead; more delays behind the ⋯ button.
+  readonly property var snoozeChoices: {
+    var seconds = [root.configuredSnooze]
+    if (seconds.indexOf(300) < 0) seconds.push(300)
+    if (root.showMoreSnooze) {
+      var more = [600, 900, 1800]
+      for (var i = 0; i < more.length; i++) if (seconds.indexOf(more[i]) < 0) seconds.push(more[i])
+    }
+    seconds.sort(function(a, b) { return a - b })
+    var rows = seconds.map(function(value) {
+      return { label: root.tr("alert.snoozeFor").arg(root.duration(value)), seconds: value }
+    })
+    if (root.startsIn > 30) rows.push({ label: root.tr("alert.snoozeAtStart"), seconds: root.startsIn })
+    return rows
   }
 
   Timer {
@@ -146,6 +198,58 @@ Item {
       root.nowSeconds = Math.floor(Date.now() / 1000)
       var limit = root.service ? Number(root.service.autoDismissSeconds) : 0
       if (limit > 0 && root.startsIn <= -limit) root.dismiss()
+    }
+  }
+
+  // An outlined pill, the shape of every secondary control here.
+  component Pill: Rectangle {
+    id: pill
+
+    property string label: ""
+    property string glyph: ""
+    property bool primary: false
+    property int fontSize: root.buttonSize
+    property int minWidth: 0
+    signal activated()
+
+    implicitWidth: Math.max(minWidth, pillRow.implicitWidth + Style.space(30))
+    implicitHeight: pillRow.implicitHeight + Style.space(16)
+    radius: root.radius
+    color: primary ? Color.accent : (pillMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent")
+    border.width: primary ? 0 : 1
+    border.color: root.line
+
+    RowLayout {
+      id: pillRow
+      anchors.centerIn: parent
+      spacing: Style.space(8)
+
+      Text {
+        visible: pill.glyph !== ""
+        text: pill.glyph
+        color: pill.primary ? Color.background : root.ink
+        font.family: root.glyphFamily
+        font.pixelSize: pill.fontSize + 2
+      }
+
+      Text {
+        visible: pill.label !== ""
+        text: pill.label
+        color: pill.primary ? Color.background : root.ink
+        font.family: root.textFamily
+        font.pixelSize: pill.fontSize
+        font.weight: Font.DemiBold
+        elide: Text.ElideRight
+        Layout.maximumWidth: Style.space(220)
+      }
+    }
+
+    MouseArea {
+      id: pillMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: pill.activated()
     }
   }
 
@@ -171,13 +275,39 @@ Item {
       WlrLayershell.keyboardFocus: root.opened && takesKeyboard ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
       exclusionMode: ExclusionMode.Ignore
 
-      // Fully opaque on purpose. This is the one surface that is allowed to
-      // interrupt, and a translucent one lets the desktop behind it keep
-      // competing for attention — the theme's background may also carry its own
-      // alpha, so the channels are taken and the opacity is pinned.
+      // Fully opaque on purpose: the theme colour first, the blurred wallpaper
+      // over it once loaded, then a dimming veil so the text always reads.
       Rectangle {
         anchors.fill: parent
         color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 1.0)
+      }
+
+      Image {
+        id: wallpaper
+        anchors.fill: parent
+        visible: false
+        source: root.opened ? "file://" + root.wallpaperPath : ""
+        fillMode: Image.PreserveAspectCrop
+        asynchronous: true
+        cache: false
+        sourceSize: Qt.size(Math.max(1, window.width / 2), Math.max(1, window.height / 2))
+      }
+
+      MultiEffect {
+        anchors.fill: parent
+        source: wallpaper
+        visible: wallpaper.status === Image.Ready
+        autoPaddingEnabled: false
+        blurEnabled: true
+        blur: 1.0
+        blurMax: 96
+        blurMultiplier: 1.4
+        saturation: 0.15
+      }
+
+      Rectangle {
+        anchors.fill: parent
+        color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.45)
       }
 
       FocusScope {
@@ -194,31 +324,46 @@ Item {
           }
           switch (keyEvent.key) {
           case Qt.Key_Escape:
-            root.dismiss(); keyEvent.accepted = true; break
+            if (root.showLinkMenu || root.showNotes) {
+              root.showLinkMenu = false
+              root.showNotes = false
+            } else {
+              root.dismiss()
+            }
+            keyEvent.accepted = true; break
           case Qt.Key_Return:
           case Qt.Key_Enter:
             if (root.link) root.join(); else root.dismiss()
             keyEvent.accepted = true; break
           case Qt.Key_S:
-            root.snooze(); keyEvent.accepted = true; break
+            root.snooze(0); keyEvent.accepted = true; break
           default:
             break
           }
         }
 
+        // A click on the background closes the link menu, nothing more.
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.showLinkMenu = false
+        }
+
+        Text {
+          anchors.top: parent.top
+          anchors.right: parent.right
+          anchors.margins: Style.space(18)
+          text: Qt.formatDateTime(new Date(root.nowSeconds * 1000), "HH:mm:ss")
+          color: root.ink
+          font.family: root.textFamily
+          font.pixelSize: Style.font.subtitle
+          font.weight: Font.DemiBold
+          font.features: { "tnum": 1 }
+        }
+
         ColumnLayout {
           anchors.centerIn: parent
-          width: Math.min(parent.width - Style.space(96), Style.space(880))
-          spacing: Style.space(12)
-
-          Text {
-            Layout.alignment: Qt.AlignHCenter
-            text: root.countdownText()
-            color: root.startsIn <= 0 ? Color.urgent : Color.accent
-            font.family: Style.font.family
-            font.pixelSize: root.countdownSize
-            font.weight: Font.Bold
-          }
+          width: Math.min(parent.width - Style.space(96), Style.space(980))
+          spacing: Style.space(6)
 
           Text {
             Layout.alignment: Qt.AlignHCenter
@@ -227,9 +372,10 @@ Item {
             // The event title comes straight from a calendar we do not
             // control; AutoText would let it be interpreted as rich text.
             textFormat: Text.PlainText
-            color: Color.foreground
-            font.family: Style.font.family
+            color: root.ink
+            font.family: root.textFamily
             font.pixelSize: root.titleSize
+            font.weight: Font.Bold
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             maximumLineCount: 3
@@ -242,91 +388,247 @@ Item {
             text: {
               if (!root.event) return ""
               // A reminder (start = end) has a time, not a span.
-              var span = Number(root.event.end) > Number(root.event.start)
+              return Number(root.event.end) > Number(root.event.start)
                 ? root.clockOf(root.event.start) + " – " + root.clockOf(root.event.end)
                 : root.clockOf(root.event.start)
-              return root.calendarName ? span + "  ·  " + root.calendarName : span
             }
-            // calendarName is the calendar's own X-WR-CALNAME, also untrusted.
-            textFormat: Text.PlainText
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: root.detailSize
+            color: root.ink
+            font.family: root.textFamily
+            font.pixelSize: root.spanSize
+            font.features: { "tnum": 1 }
+          }
+
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            text: root.statusText()
+            color: root.startsIn <= 0 ? Color.urgent : root.ink
+            font.family: root.textFamily
+            font.pixelSize: root.statusSize
           }
 
           Text {
             Layout.alignment: Qt.AlignHCenter
             Layout.fillWidth: true
             visible: text !== ""
-            text: root.link ? root.linkLabel() : root.location
-            // Both the link host and the free-text location are calendar-
-            // controlled.
+            // calendarName is the calendar's own X-WR-CALNAME and the
+            // location is free text; both are calendar-controlled.
+            text: [root.location, root.calendarName].filter(function(part) { return part !== "" }).join("  ·  ")
             textFormat: Text.PlainText
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.subtitle
+            color: root.quiet
+            font.family: root.textFamily
+            font.pixelSize: Style.font.body
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideMiddle
           }
 
+          // Notes and calendar, as small square buttons.
           RowLayout {
             Layout.alignment: Qt.AlignHCenter
-            Layout.topMargin: Style.space(20)
+            Layout.topMargin: Style.space(8)
+            visible: root.notes !== "" || root.calendarUrl !== ""
             spacing: Style.space(12)
 
-            Repeater {
-              model: [
-                { label: root.link ? "Join" : "Got it", hint: "Enter", primary: true, action: "join" },
-                { label: "Snooze", hint: "S", primary: false, action: "snooze" },
-                { label: "Dismiss", hint: "Esc", primary: false, action: "dismiss" }
-              ]
+            Pill {
+              visible: root.notes !== ""
+              glyph: "󰍩"
+              implicitWidth: implicitHeight
+              color: root.showNotes ? Qt.rgba(1, 1, 1, 0.16) : "transparent"
+              onActivated: root.showNotes = !root.showNotes
+            }
 
-              delegate: Rectangle {
-                required property var modelData
+            Pill {
+              visible: root.calendarUrl !== ""
+              glyph: "󰃭"
+              implicitWidth: implicitHeight
+              onActivated: root.openCalendar()
+            }
+          }
 
-                implicitWidth: buttonRow.implicitWidth + Style.space(32)
-                implicitHeight: buttonRow.implicitHeight + Style.space(18)
-                radius: Style.cornerRadius
-                color: modelData.primary ? Color.accent : "transparent"
-                border.width: modelData.primary ? 0 : 1
-                border.color: Color.muted
+          Rectangle {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(8)
+            Layout.preferredWidth: Math.min(Style.space(620), parent.width)
+            Layout.preferredHeight: notesText.implicitHeight + Style.space(24)
+            visible: root.showNotes && root.notes !== ""
+            radius: root.radius
+            color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.55)
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 0.12)
+
+            Text {
+              id: notesText
+              anchors.fill: parent
+              anchors.margins: Style.space(12)
+              text: root.notes
+              // Event description: calendar-controlled, already stripped of
+              // HTML by the agenda reader, never rendered as rich text.
+              textFormat: Text.PlainText
+              color: root.ink
+              font.family: root.textFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+              maximumLineCount: 14
+              elide: Text.ElideRight
+            }
+          }
+
+          // Join, with the link's own menu behind the chevron.
+          Rectangle {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(30)
+            Layout.preferredWidth: root.actionWidth
+            Layout.preferredHeight: joinLabel.implicitHeight + Style.space(16)
+            visible: root.link !== ""
+            radius: root.radius
+            color: Color.accent
+
+            RowLayout {
+              anchors.fill: parent
+              spacing: 0
+
+              Item {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
 
                 RowLayout {
-                  id: buttonRow
+                  id: joinLabel
                   anchors.centerIn: parent
                   spacing: Style.space(10)
 
                   Text {
-                    text: modelData.label
-                    color: modelData.primary ? Color.background : Color.foreground
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.title
+                    text: "󰕧"
+                    color: Color.background
+                    font.family: root.glyphFamily
+                    font.pixelSize: root.buttonSize + 4
                   }
 
                   Text {
-                    text: modelData.hint
-                    color: modelData.primary ? Color.background : Color.muted
-                    opacity: 0.7
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
+                    text: root.tr("alert.join")
+                    color: Color.background
+                    font.family: root.textFamily
+                    font.pixelSize: root.buttonSize
+                    font.weight: Font.Bold
                   }
                 }
 
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (modelData.action === "join") {
-                      if (root.link) root.join(); else root.dismiss()
-                    } else if (modelData.action === "snooze") {
-                      root.snooze()
-                    } else {
-                      root.dismiss()
-                    }
-                  }
+                  onClicked: root.join()
+                }
+              }
+
+              Rectangle {
+                Layout.fillHeight: true
+                implicitWidth: 1
+                color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.35)
+              }
+
+              Item {
+                Layout.fillHeight: true
+                implicitWidth: Style.space(40)
+
+                Text {
+                  anchors.centerIn: parent
+                  text: root.showLinkMenu ? "󰅃" : "󰅀"
+                  color: Color.background
+                  font.family: root.glyphFamily
+                  font.pixelSize: root.buttonSize + 2
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.showLinkMenu = !root.showLinkMenu
                 }
               }
             }
+          }
+
+          ColumnLayout {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: root.actionWidth
+            visible: root.showLinkMenu && root.link !== ""
+            spacing: Style.space(4)
+
+            Text {
+              Layout.fillWidth: true
+              text: root.linkLabel()
+              // The link host is calendar-controlled.
+              textFormat: Text.PlainText
+              color: root.quiet
+              font.family: root.textFamily
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideMiddle
+            }
+
+            Pill {
+              Layout.fillWidth: true
+              label: root.tr("alert.copyLink")
+              glyph: "󰆏"
+              fontSize: Style.font.body
+              onActivated: root.copyLink()
+            }
+          }
+
+          Pill {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: root.link !== "" ? Style.space(4) : Style.space(30)
+            Layout.preferredWidth: root.actionWidth
+            label: root.tr("alert.close")
+            primary: root.link === ""
+            onActivated: root.dismiss()
+          }
+
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(56)
+            text: root.tr("alert.snooze")
+            color: root.ink
+            font.family: root.textFamily
+            font.pixelSize: Style.font.subtitle
+          }
+
+          RowLayout {
+            Layout.alignment: Qt.AlignHCenter
+            spacing: Style.space(10)
+
+            Repeater {
+              model: root.snoozeChoices
+
+              delegate: Pill {
+                required property var modelData
+                label: modelData.label
+                fontSize: Style.font.body
+                minWidth: Style.space(150)
+                onActivated: root.snooze(modelData.seconds)
+              }
+            }
+
+            Text {
+              text: "󰇘"
+              color: root.quiet
+              font.family: root.glyphFamily
+              font.pixelSize: Style.font.title
+
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(6)
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.showMoreSnooze = !root.showMoreSnooze
+              }
+            }
+          }
+
+          Text {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Style.space(28)
+            text: (root.link ? root.tr("alert.keys") : root.tr("alert.keysNoLink"))
+              .arg(root.duration(root.configuredSnooze))
+            color: root.quiet
+            font.family: root.textFamily
+            font.pixelSize: Style.font.caption
           }
 
           Text {
@@ -338,7 +640,7 @@ Item {
             // content; never let it be interpreted as rich text.
             textFormat: Text.PlainText
             color: Color.urgent
-            font.family: Style.font.family
+            font.family: root.textFamily
             font.pixelSize: Style.font.caption
           }
         }

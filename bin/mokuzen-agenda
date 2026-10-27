@@ -67,6 +67,8 @@ DEFAULTS = {
     "ignoreTitles": [],
     "onlyWithLink": False,
     "maxMeetingHours": 12,
+    # "" follows the shell's language (Setup > Language); "fr", "en"… force one.
+    "language": "",
     "enabled": True,
 }
 
@@ -128,6 +130,7 @@ MAX_REGEX_INPUT_CHARS = 2_000
 MAX_REGEX_SECONDS = 0.02
 MAX_CURRENT_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 MAX_CHECK_CANDIDATES = 20
+MAX_NOTES_CHARS = 1_500
 MAX_ICS_DIR_DEPTH = 64
 
 
@@ -195,6 +198,10 @@ def _validate_config(loaded: dict, path: Path) -> dict:
     cfg["selfEmails"] = _bounded_string_list(
         cfg.get("selfEmails", []), "selfEmails", MAX_SELF_EMAILS, MAX_EMAIL_CHARS
     )
+
+    language = cfg.get("language", "")
+    if not isinstance(language, str) or not re.fullmatch(r"(?:[a-z]{2,3}(?:-[A-Za-z]{2,4})?)?", language):
+        raise ValueError('language must be "" or a code such as "fr" or "pt-BR"')
 
     for key in ("ignoreAllDay", "skipCancelled", "skipDeclined", "onlyWithLink", "enabled"):
         if not isinstance(cfg.get(key), bool):
@@ -1597,6 +1604,31 @@ def self_addresses(cfg: dict) -> set[str]:
     return mine
 
 
+def plain_notes(event: dict) -> str:
+    """The description as readable text for the alert's notes button.
+    Outlook and Viva send HTML; tags and entities go, whitespace collapses."""
+    text = event.get("description", "")[:MAX_DESCRIPTION_CHARS]
+    text = re.sub(r"(?i)<br\s*/?>|</(?:p|div|li)>", "\n", text)
+    text = re.sub(r"<[^>]{0,2000}>", "", text)
+    for entity, char in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                         ("&quot;", '"'), ("&#39;", "'"), ("&#038;", "&")):
+        text = text.replace(entity, char)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    text = "\n".join(line for line in lines if line)
+    if text.strip().lower() == "this is an event reminder":
+        return ""
+    return text[:MAX_NOTES_CHARS]
+
+
+def calendar_url(event: dict, start: datetime) -> str:
+    """Where the calendar button goes: Google's day view for a Google event.
+    Other providers have no stable public address for an event; no button."""
+    if event.get("uid", "").lower().endswith("@google.com"):
+        day = start.astimezone(local_zone())
+        return f"https://calendar.google.com/calendar/r/day/{day.year}/{day.month}/{day.day}"
+    return ""
+
+
 def occurrence_key(value) -> int | None:
     """One instant for a RECURRENCE-ID or an expanded start, whatever zone
     either was written in: Google can write the override in UTC and the
@@ -1739,6 +1771,8 @@ def occurrences(cfg: dict, now: datetime, horizon: timedelta, force_refresh: boo
                 "summary": (event["summary"] or "(no title)")[:MAX_FIELD_CHARS],
                 "location": event["location"][:MAX_FIELD_CHARS],
                 "link": link[:MAX_LINK_CHARS],
+                "notes": plain_notes(event),
+                "calendarUrl": calendar_url(event, start),
                 "calendar": event["calendar"][:MAX_SOURCE_CHARS],
                 "allDay": event["all_day"],
                 "start": int(start.timestamp()),
@@ -1855,6 +1889,7 @@ def cmd_setup(args) -> int:
         ("leadSeconds", args.lead),
         ("pollSeconds", args.poll),
         ("snoozeSeconds", args.snooze),
+        ("language", args.language),
     ):
         if value is not None:
             data[key] = value
@@ -1926,7 +1961,7 @@ def config_fingerprint(cfg: dict) -> str:
         )
     }
     # Bumped whenever parsing changes what the same calendar expands to.
-    relevant["_reader"] = 2
+    relevant["_reader"] = 3
     blob = json.dumps(relevant, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -1951,6 +1986,8 @@ def _validated_cached_occurrences(payload: dict) -> tuple[list[dict], list[str]]
         "summary": MAX_FIELD_CHARS,
         "location": MAX_FIELD_CHARS,
         "link": MAX_LINK_CHARS,
+        "notes": MAX_NOTES_CHARS,
+        "calendarUrl": MAX_LINK_CHARS,
         "calendar": MAX_SOURCE_CHARS,
     }
     events: list[dict] = []
@@ -2231,6 +2268,7 @@ def main(argv: list[str]) -> int:
     setup.add_argument("--lead", type=int, metavar="SECONDS", help="how long before the start the alert appears")
     setup.add_argument("--poll", type=int, metavar="SECONDS", help="how often the agenda is consulted")
     setup.add_argument("--snooze", type=int, metavar="SECONDS", help="how long the snooze key hides an alert")
+    setup.add_argument("--language", metavar="CODE", help='alert language: "fr", "en"…, or "" to follow the shell')
     setup.add_argument("--show", action="store_true", help="print the resulting configuration, secrets masked")
     setup.add_argument("--no-verify", action="store_true", help="skip fetching the calendars afterwards")
     setup.set_defaults(func=cmd_setup)

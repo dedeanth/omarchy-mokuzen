@@ -57,6 +57,10 @@ BarWidget {
     onTriggered: root.nowSeconds = Math.floor(Date.now() / 1000)
   }
 
+  function tr(key) {
+    return root.service ? root.service.t(key) : key
+  }
+
   function clockOf(epoch) {
     return Qt.formatDateTime(new Date(Number(epoch) * 1000), "HH:mm")
   }
@@ -73,7 +77,7 @@ BarWidget {
 
   function barLabel() {
     if (!root.configured) return "set up"
-    if (root.inMeeting) return "En cours · " + root.shortDelay(root.endsIn)
+    if (root.inMeeting) return root.tr("bar.inProgress").arg(root.shortDelay(root.endsIn))
     if (!root.nextEvent) return ""
     switch (root.labelStyle) {
     case "time": return root.clockOf(root.nextEvent.start)
@@ -211,8 +215,8 @@ BarWidget {
 
         Text {
           text: root.configured
-            ? (root.currentMeeting ? "Now" : "Next up")
-            : "Mokuzen is not set up yet"
+            ? root.tr(root.currentMeeting ? "panel.now" : "panel.nextUp")
+            : root.tr("panel.notSetUp")
           color: Color.popups.text
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
@@ -224,7 +228,7 @@ BarWidget {
           spacing: Style.space(8)
 
           Text {
-            text: root.currentMeeting ? root.shortDelay(root.endsIn) + " left" : ""
+            text: root.currentMeeting ? root.tr("panel.left").arg(root.shortDelay(root.endsIn)) : ""
             color: Color.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -243,7 +247,7 @@ BarWidget {
 
         Text {
           visible: !!root.currentMeeting
-          text: "Next up"
+          text: root.tr("panel.nextUp")
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -289,7 +293,7 @@ BarWidget {
         Text {
           Layout.fillWidth: true
           visible: root.configured && root.events.length === 0
-          text: "Nothing in the next 24 hours."
+          text: root.tr("panel.nothing")
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -299,7 +303,7 @@ BarWidget {
 
         // ---- the calendars
         Text {
-          text: "Calendars"
+          text: root.tr("panel.calendars")
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -359,7 +363,7 @@ BarWidget {
             Text {
               id: addTriggerLabel
               anchors.centerIn: parent
-              text: root.calendars.length > 0 ? "＋  Add a calendar" : "＋  Add your calendar"
+              text: root.tr(root.calendars.length > 0 ? "panel.addCalendar" : "panel.addYourCalendar")
               color: Color.popups.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -381,7 +385,7 @@ BarWidget {
             visible: root.editingCalendar
             Layout.fillWidth: true
             maximumLength: 4096
-            placeholderText: "paste the address, then Enter"
+            placeholderText: root.tr("panel.paste")
             Keys.onEscapePressed: root.cancelEditingCalendar()
             color: Color.popups.text
             font.family: root.fontFamily
@@ -409,7 +413,7 @@ BarWidget {
             Text {
               id: addLabel
               anchors.centerIn: parent
-              text: "Add"
+              text: root.tr("panel.add")
               color: addressField.text.length > 0 ? Color.popups.background : Color.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -431,8 +435,8 @@ BarWidget {
 
           Repeater {
             model: [
-              { label: "Alert", suffix: "s before", key: "lead" },
-              { label: "Snooze", suffix: "s", key: "snooze" }
+              { label: root.tr("panel.alert"), suffix: root.tr("panel.alertSuffix"), key: "lead" },
+              { label: root.tr("panel.snooze"), suffix: " s", key: "snooze" }
             ]
 
             delegate: RowLayout {
@@ -491,7 +495,7 @@ BarWidget {
           Layout.fillWidth: true
           visible: text !== ""
           text: {
-            if (root.service && root.service.busy) return "saving…"
+            if (root.service && root.service.busy) return root.tr("panel.saving")
             if (root.service && root.service.lastWarning !== "") return root.service.lastWarning
             return ""
           }
